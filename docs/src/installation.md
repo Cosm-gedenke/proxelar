@@ -34,5 +34,5 @@ cargo install proxelar --no-default-features
 
 ## Requirements
 
-- Rust 1.94 or later
+- Rust 1.97.1 or later
 - Works on Linux, macOS, and Windows

@@ -20,7 +20,8 @@ env:
   COVERAGE_MIN_LINES: "80"
   COVERAGE_TARGET_LINES: "80"
   CORE_COVERAGE_TARGET_LINES: "90"
-  MSRV: "1.94"
+  MSRV: "1.97.1"
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   fmt:
@@ -37,6 +38,8 @@ jobs:
     name: Test (${{ matrix.os }}, ${{ matrix.rust }})
     needs: fmt
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +51,7 @@ jobs:
           - os: windows-latest
             rust: stable
           - os: ubuntu-latest
-            rust: "1.94"
+            rust: "1.97.1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -59,7 +62,7 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features
       - name: Test
         run: cargo test --workspace --locked
 

@@ -19,7 +19,7 @@ cargo test --workspace --no-default-features
 
 # Lint, format, and package
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features
 cargo package --workspace --list
 ```
 
@@ -39,7 +39,7 @@ Run the full local gate before large changes:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features
 cargo build --workspace
 cargo build --workspace --no-default-features
 cargo test --workspace

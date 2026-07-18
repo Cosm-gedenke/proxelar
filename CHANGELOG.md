@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-18
+
+### Fixed
+
+- Allow the web GUI WebSocket to connect when Proxelar is opened through a same-origin LAN IPv4 address, IPv6 address, or hostname instead of rejecting every non-`localhost` origin.
+- Compare the WebSocket `Origin` authority with the request `Host`, including explicit ports and bracketed IPv6 hosts, while continuing to reject malformed, missing, or cross-origin values.
+- Preserve the existing WebSocket access-token requirement, with regression coverage for missing and incorrect tokens as well as invalid origins.
+
+### Changed
+
+- Raise the minimum supported Rust version and pinned development toolchain to Rust 1.97.1, including CI, release builds, documentation, and the Docker builder image.
+- Deny compiler warnings through Cargo 1.97's workspace configuration so local builds, tests, and CI share the same warning policy.
+- Update the Rust dependency set, including mlua 0.12, tokio-tungstenite 0.30, and reqwest 0.13, and adapt Lua string/body handling to the current APIs without changing script error pass-through behavior.
+- Update the GitHub Actions dependencies used for checkout, artifact upload/download, Pages deployment, and release automation.
+
 ## [0.4.7] - 2026-06-14
 
 - Lua hooks now receive decompressed `gzip`, `deflate`, and `br` bodies and re-encode the result to the original `Content-Encoding` on the way out (with `Content-Length` refreshed), so scripts always work on plaintext. Removing or changing the `Content-Encoding` header in a hook now rewrites the wire body correctly even when the Lua-visible body is unchanged.

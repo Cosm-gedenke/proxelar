@@ -132,7 +132,7 @@ impl ScriptEngine {
                     )
                     .map_err(|e| crate::Error::Script(format!("Invalid response headers: {e}")))?;
                     let body: Bytes = t
-                        .get::<mlua::String>("body")
+                        .get::<mlua::LuaString>("body")
                         .map(|s| Bytes::copy_from_slice(&s.as_bytes()))
                         .unwrap_or_default();
                     Ok(ScriptRequestAction::ShortCircuit {
@@ -154,7 +154,7 @@ impl ScriptEngine {
                     )
                     .map_err(|e| crate::Error::Script(format!("Invalid request headers: {e}")))?;
                     let body: Bytes = t
-                        .get::<mlua::String>("body")
+                        .get::<mlua::LuaString>("body")
                         .map(|s| Bytes::copy_from_slice(&s.as_bytes()))
                         .unwrap_or_default();
                     Ok(ScriptRequestAction::Forward {
@@ -217,7 +217,7 @@ impl ScriptEngine {
                 )
                 .map_err(|e| crate::Error::Script(format!("Invalid response headers: {e}")))?;
                 let body: Bytes = t
-                    .get::<mlua::String>("body")
+                    .get::<mlua::LuaString>("body")
                     .map(|s| Bytes::copy_from_slice(&s.as_bytes()))
                     .unwrap_or_default();
                 Ok(ScriptResponseAction::Modified {
@@ -270,7 +270,7 @@ fn headermap_to_lua_table(lua: &Lua, headers: &HeaderMap) -> LuaResult<mlua::Tab
 fn lua_table_to_headermap(table: &mlua::Table) -> LuaResult<HeaderMap> {
     let mut headers = HeaderMap::new();
 
-    for pair in table.pairs::<mlua::String, Value>() {
+    for pair in table.pairs::<mlua::LuaString, Value>() {
         let (key, value) = pair?;
         let header_name = HeaderName::from_bytes(&key.as_bytes())
             .map_err(|e| mlua::Error::external(format!("Invalid header name: {e}")))?;
@@ -282,7 +282,7 @@ fn lua_table_to_headermap(table: &mlua::Table) -> LuaResult<HeaderMap> {
                 headers.append(header_name, header_value);
             }
             Value::Table(arr) => {
-                for v in arr.sequence_values::<mlua::String>() {
+                for v in arr.sequence_values::<mlua::LuaString>() {
                     let s = v?;
                     let header_value = HeaderValue::from_bytes(&s.as_bytes())
                         .map_err(|e| mlua::Error::external(format!("Invalid header value: {e}")))?;
