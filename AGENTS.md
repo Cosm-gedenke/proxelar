@@ -1,5 +1,5 @@
 - This is a Rust workspace. Use `cargo test --workspace` for all tests, `cargo test -p proxyapi` for the core crate, and `cargo test -p proxyapi -- scripting` for scripting tests.
-- Before finishing code changes, run `cargo fmt --all --check` and `cargo clippy --workspace -- -D warnings`.
+- Before finishing code changes, run `cargo fmt --all --check` and `cargo clippy --workspace`; `.cargo/config.toml` denies warnings for all local crates.
 - Build with `cargo build --workspace`; also check `cargo build --workspace --no-default-features` when touching Lua scripting or feature gates.
 - Keep the dependency direction `proxelar-cli` -> `proxyapi` -> `proxyapi_models`; `proxyapi_models` must stay pure data types with no async or network code.
 - Keep `#![forbid(unsafe_code)]` intact.

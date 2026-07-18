@@ -8,7 +8,10 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use http::HeaderMap;
+use http::{
+    header::{HOST, ORIGIN},
+    HeaderMap, Uri,
+};
 use proxyapi::{InterceptConfig, InterceptDecision, ProxyEvent};
 use proxyapi_models::ProxiedRequest;
 use rand::RngExt;
@@ -25,7 +28,6 @@ const APP_JS: &str = include_str!("assets/app.js");
 struct WebState {
     broadcast_tx: broadcast::Sender<String>,
     token: String,
-    gui_port: u16,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
 }
@@ -80,7 +82,6 @@ pub async fn run(
     let state = Arc::new(WebState {
         broadcast_tx: broadcast_tx.clone(),
         token,
-        gui_port,
         intercept,
         replay_tx,
     });
@@ -149,26 +150,45 @@ async fn js_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
     )
 }
 
+fn origin_matches_host(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Ok(origin) = origin.parse::<Uri>() else {
+        return false;
+    };
+
+    origin.scheme_str() == Some("http")
+        && origin
+            .authority()
+            .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
+        && origin
+            .path_and_query()
+            .is_none_or(|path_and_query| path_and_query.as_str() == "/")
+}
+
+fn token_matches(params: &HashMap<String, String>, expected: &str) -> bool {
+    params.get("token").is_some_and(|token| token == expected)
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    // Validate Origin header
-    let allowed_origins = [
-        format!("http://127.0.0.1:{}", state.gui_port),
-        format!("http://localhost:{}", state.gui_port),
-    ];
-    match headers.get("origin").and_then(|v| v.to_str().ok()) {
-        Some(origin) if allowed_origins.iter().any(|a| a == origin) => {}
-        _ => return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response(),
+    // The GUI and its WebSocket are same-origin. Comparing against Host allows
+    // LAN addresses and hostnames without permitting cross-site WebSocket use.
+    if !origin_matches_host(&headers) {
+        return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
     // Validate token
-    match params.get("token") {
-        Some(t) if t == &state.token => {}
-        _ => return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response(),
+    if !token_matches(&params, &state.token) {
+        return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -306,7 +326,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::response::IntoResponse;
-    use http::{Method, Version};
+    use http::{HeaderValue, Method, Version};
     use proxyapi_models::{ProxiedResponse, WsDirection, WsFrame, WsOpcode};
 
     fn test_state() -> (
@@ -320,7 +340,6 @@ mod tests {
             WebState {
                 broadcast_tx,
                 token: "test-token".to_owned(),
-                gui_port: 8081,
                 intercept: InterceptConfig::new(),
                 replay_tx,
             },
@@ -332,6 +351,17 @@ mod tests {
     async fn response_text(response: axum::response::Response) -> String {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn websocket_headers(host: Option<&str>, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(HOST, HeaderValue::from_str(host).unwrap());
+        }
+        if let Some(origin) = origin {
+            headers.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        }
+        headers
     }
 
     #[test]
@@ -363,6 +393,54 @@ mod tests {
         let js_text = response_text(js).await;
         assert!(js_text.contains("test-token"));
         assert!(!js_text.contains("__WS_TOKEN__"));
+    }
+
+    #[test]
+    fn websocket_origin_accepts_matching_local_and_lan_hosts() {
+        for (host, origin) in [
+            ("127.0.0.1:8081", "http://127.0.0.1:8081"),
+            ("localhost:8081", "http://localhost:8081"),
+            ("192.168.1.20:8081", "http://192.168.1.20:8081"),
+            ("PROXELAR.local:8081", "http://proxelar.local:8081"),
+            ("[::1]:8081", "http://[::1]:8081"),
+        ] {
+            let headers = websocket_headers(Some(host), Some(origin));
+
+            assert!(origin_matches_host(&headers));
+        }
+    }
+
+    #[test]
+    fn websocket_origin_rejects_missing_malformed_and_cross_site_values() {
+        for (host, origin) in [
+            (None, Some("http://192.168.1.20:8081")),
+            (Some("192.168.1.20:8081"), None),
+            (Some("192.168.1.20:8081"), Some("null")),
+            (Some("192.168.1.20:8081"), Some("not-an-origin")),
+            (Some("192.168.1.20:8081"), Some("https://192.168.1.20:8081")),
+            (
+                Some("192.168.1.20:8081"),
+                Some("http://192.168.1.20:8081/path"),
+            ),
+            (
+                Some("192.168.1.20:8081"),
+                Some("http://attacker.example:8081"),
+            ),
+        ] {
+            let headers = websocket_headers(host, origin);
+
+            assert!(!origin_matches_host(&headers));
+        }
+    }
+
+    #[test]
+    fn websocket_token_must_match() {
+        let valid = HashMap::from([("token".to_owned(), "test-token".to_owned())]);
+        let invalid = HashMap::from([("token".to_owned(), "wrong-token".to_owned())]);
+
+        assert!(token_matches(&valid, "test-token"));
+        assert!(!token_matches(&invalid, "test-token"));
+        assert!(!token_matches(&HashMap::new(), "test-token"));
     }
 
     #[tokio::test]

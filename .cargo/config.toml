@@ -1,0 +1,6 @@
+[build]
+warnings = "deny"
+
+# OpenSSL's static MSVC build omits PDB files; suppress only its LNK4099 noise.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/IGNORE:4099"]
