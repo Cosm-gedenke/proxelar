@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri, Version};
-use proxyapi_models::{ProxiedRequest, ProxiedResponse, WsDirection, WsFrame, WsOpcode};
+use proxyapi_models::{
+    BodyMetadata, CapturedDnsExchange, CapturedUdpExchange, ProxiedRequest, ProxiedResponse,
+    TrafficSession, WsDirection, WsFrame, WsOpcode, SESSION_FORMAT_VERSION,
+};
 
 #[test]
 fn test_proxied_request_serialization() {
@@ -192,4 +195,63 @@ fn test_ws_frame_variants_serialize() {
     }
 
     assert!(serde_json::from_value::<WsOpcode>(serde_json::json!("text")).is_err());
+}
+
+#[test]
+fn body_metadata_distinguishes_captured_bytes_from_wire_bytes() {
+    let request = ProxiedRequest::new_with_body_metadata(
+        Method::POST,
+        "https://example.com/upload".parse().unwrap(),
+        Version::HTTP_11,
+        HeaderMap::new(),
+        Bytes::from_static(b"prefix"),
+        BodyMetadata {
+            truncated: true,
+            total_seen: 4096,
+        },
+        1,
+    );
+    let encoded = serde_json::to_string(&request).unwrap();
+    let decoded: ProxiedRequest = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded.body().len(), 6);
+    assert_eq!(decoded.body_metadata().total_seen, 4096);
+    assert!(decoded.body_metadata().truncated);
+}
+
+#[test]
+fn traffic_session_roundtrip_keeps_version_and_dns_state() {
+    let mut session = TrafficSession::new(123);
+    session.dns_exchanges.push(CapturedDnsExchange {
+        id: 7,
+        name: "api.example.test".to_owned(),
+        query_type: 1,
+        time: 123,
+        answers: vec!["127.0.0.1".to_owned()],
+        overridden: true,
+        completed: true,
+    });
+    session.udp_exchanges.push(CapturedUdpExchange {
+        id: 8,
+        target: "127.0.0.1:9000".to_owned(),
+        client: "127.0.0.1:50000".to_owned(),
+        time: 124,
+        request: Bytes::from_static(b"\0request"),
+        response: Bytes::from_static(b"\xffresponse"),
+        response_received: true,
+        request_truncated: false,
+        response_truncated: true,
+    });
+
+    let encoded = serde_json::to_string(&session).unwrap();
+    let decoded: TrafficSession = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded.version, SESSION_FORMAT_VERSION);
+    assert_eq!(decoded.created_at, 123);
+    assert_eq!(decoded.dns_exchanges[0].answers, ["127.0.0.1"]);
+    assert!(decoded.dns_exchanges[0].completed);
+    assert_eq!(decoded.udp_exchanges[0].request.as_ref(), b"\0request");
+    assert_eq!(decoded.udp_exchanges[0].response.as_ref(), b"\xffresponse");
+    assert!(decoded.udp_exchanges[0].response_received);
+    assert!(decoded.udp_exchanges[0].response_truncated);
 }

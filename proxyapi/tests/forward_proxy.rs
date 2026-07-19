@@ -37,8 +37,6 @@ async fn test_forward_proxy_starts_and_shuts_down() {
         body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
         #[cfg(feature = "scripting")]
         script_path: None,
-        #[cfg(feature = "scripting")]
-        allow_c_modules: false,
         replay_rx: None,
     };
 
@@ -59,6 +57,70 @@ async fn test_forward_proxy_starts_and_shuts_down() {
 
     let result = handle.await.unwrap();
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn transparent_proxy_with_explicit_target_inspects_http() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (upstream_addr, upstream_shutdown) = start_upstream_server().await;
+    let proxy_addr = reserve_loopback_addr().await;
+    let ca_dir = tempfile::tempdir().unwrap();
+    let (event_tx, mut event_rx) = mpsc::channel::<ProxyEvent>(100);
+    let config = ProxyConfig {
+        addr: proxy_addr,
+        mode: ProxyMode::Transparent {
+            target: Some(upstream_addr.to_string().parse().unwrap()),
+        },
+        event_tx,
+        ca_dir: ca_dir.path().to_path_buf(),
+        upstream_tls: UpstreamTlsConfig::Default,
+        intercept: None,
+        body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
+        #[cfg(feature = "scripting")]
+        script_path: None,
+        replay_rx: None,
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        Proxy::new(config)
+            .start(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+    });
+    wait_for_tcp(proxy_addr).await.unwrap();
+
+    let raw_response = send_raw_request(
+        proxy_addr,
+        format!(
+            "GET /transparent?inspect=yes HTTP/1.1\r\n\
+             Host: {upstream_addr}\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert!(raw_response.starts_with("HTTP/1.1 200 OK"));
+    assert_response_header(
+        &raw_response,
+        "x-upstream-path-query",
+        "/transparent?inspect=yes",
+    );
+    match recv_request_complete(&mut event_rx).await {
+        ProxyEvent::RequestComplete { request, .. } => {
+            assert_eq!(request.uri().scheme_str(), Some("http"));
+            assert_eq!(
+                request.uri().authority().unwrap().as_str(),
+                upstream_addr.to_string()
+            );
+        }
+        other => panic!("expected RequestComplete event, got {other:?}"),
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = upstream_shutdown.send(());
+    assert!(handle.await.unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -696,8 +758,6 @@ async fn start_forward_proxy() -> (
         body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
         #[cfg(feature = "scripting")]
         script_path: None,
-        #[cfg(feature = "scripting")]
-        allow_c_modules: false,
         replay_rx: None,
     };
 
@@ -738,8 +798,6 @@ async fn start_forward_proxy_with_replay() -> (
         body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
         #[cfg(feature = "scripting")]
         script_path: None,
-        #[cfg(feature = "scripting")]
-        allow_c_modules: false,
         replay_rx: Some(replay_rx),
     };
 

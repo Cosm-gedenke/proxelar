@@ -13,7 +13,9 @@ use moka::future::Cache;
 use openssl::{
     asn1::{Asn1Integer, Asn1Time},
     bn::BigNum,
+    ec::{EcGroup, EcKey},
     hash::MessageDigest,
+    nid::Nid,
     pkey::{PKey, Private},
     rand,
     x509::{
@@ -21,7 +23,7 @@ use openssl::{
         X509Builder, X509NameBuilder, X509,
     },
 };
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::ServerConfig;
 
 const TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -40,7 +42,6 @@ pub trait CertificateAuthority: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct Ssl {
     pkey: PKey<Private>,
-    private_key_der: Vec<u8>,
     ca_cert: X509,
     ca_cert_pem: Bytes,
     hash: MessageDigest,
@@ -89,11 +90,8 @@ impl Ssl {
 
         let ca_cert_pem = Bytes::from(ca_cert.to_pem()?);
 
-        let private_key_der = pkey.rsa()?.private_key_to_der()?;
-
         Ok(Self {
             pkey,
-            private_key_der,
             ca_cert,
             ca_cert_pem,
             hash: MessageDigest::sha256(),
@@ -111,7 +109,12 @@ impl Ssl {
     fn gen_cert(
         &self,
         authority: &Authority,
-    ) -> Result<CertificateDer<'static>, crate::error::Error> {
+    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), crate::error::Error> {
+        // Every leaf gets its own P-256 key. Reusing the CA private key as the
+        // server key would unnecessarily expose the root of trust to every TLS
+        // handshake and makes key rotation/auditing much harder.
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let leaf_key = PKey::from_ec_key(EcKey::generate(&group)?)?;
         let mut name_builder = X509NameBuilder::new()?;
         name_builder.append_entry_by_text("CN", authority.host())?;
         let name = name_builder.build();
@@ -127,12 +130,17 @@ impl Ssl {
         x509_builder.set_not_before(Asn1Time::from_unix(not_before)?.as_ref())?;
         x509_builder.set_not_after(Asn1Time::from_unix(not_before + TTL_SECS)?.as_ref())?;
 
-        x509_builder.set_pubkey(&self.pkey)?;
+        x509_builder.set_pubkey(&leaf_key)?;
         x509_builder.set_issuer_name(self.ca_cert.subject_name())?;
 
-        let alternative_name = SubjectAlternativeName::new()
-            .dns(authority.host())
-            .build(&x509_builder.x509v3_context(Some(&self.ca_cert), None))?;
+        let mut alternative_names = SubjectAlternativeName::new();
+        if authority.host().parse::<std::net::IpAddr>().is_ok() {
+            alternative_names.ip(authority.host());
+        } else {
+            alternative_names.dns(authority.host());
+        }
+        let alternative_name =
+            alternative_names.build(&x509_builder.x509v3_context(Some(&self.ca_cert), None))?;
         x509_builder.append_extension(alternative_name)?;
 
         let mut serial_number = [0; 16];
@@ -144,7 +152,8 @@ impl Ssl {
 
         x509_builder.sign(&self.pkey, self.hash)?;
         let x509 = x509_builder.build();
-        Ok(CertificateDer::from(x509.to_der()?))
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.private_key_to_pkcs8()?));
+        Ok((CertificateDer::from(x509.to_der()?), key))
     }
 }
 
@@ -204,10 +213,8 @@ impl CertificateAuthority for Ssl {
         }
         tracing::debug!("Generating server config for {authority}");
 
-        let certs = vec![self.gen_cert(authority)?];
-
-        let private_key =
-            PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(self.private_key_der.clone()));
+        let (certificate, private_key) = self.gen_cert(authority)?;
+        let certs = vec![certificate];
 
         let mut server_cfg = ServerConfig::builder()
             .with_no_client_auth()
@@ -222,5 +229,41 @@ impl CertificateAuthority for Ssl {
             .await;
 
         Ok(server_cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minted_leaf_uses_a_distinct_matching_private_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let ssl = Ssl::load_or_generate(directory.path()).unwrap();
+        let authority: Authority = "api.example.test:443".parse().unwrap();
+
+        let (certificate, private_key) = ssl.gen_cert(&authority).unwrap();
+        let leaf = X509::from_der(certificate.as_ref()).unwrap();
+        let leaf_key = PKey::private_key_from_pkcs8(private_key.secret_der()).unwrap();
+        let leaf_public = leaf.public_key().unwrap();
+
+        assert!(leaf_public.public_eq(&leaf_key));
+        assert!(!leaf_public.public_eq(&ssl.pkey));
+    }
+
+    #[test]
+    fn minted_ip_leaf_uses_an_ip_subject_alternative_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let ssl = Ssl::load_or_generate(directory.path()).unwrap();
+        let authority: Authority = "127.0.0.1:443".parse().unwrap();
+
+        let (certificate, _) = ssl.gen_cert(&authority).unwrap();
+        let leaf = X509::from_der(certificate.as_ref()).unwrap();
+        let names = leaf.subject_alt_names().unwrap();
+
+        assert!(names
+            .iter()
+            .any(|name| name.ipaddress() == Some([127, 0, 0, 1].as_slice())));
+        assert!(names.iter().all(|name| name.dnsname().is_none()));
     }
 }

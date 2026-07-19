@@ -1,4 +1,4 @@
-use proxyapi_models::{ProxiedRequest, ProxiedResponse, WsFrame};
+use proxyapi_models::{CapturedUdpExchange, ProxiedRequest, ProxiedResponse, TcpChunk, WsFrame};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,10 +53,42 @@ pub enum ProxyEvent {
     },
     /// The WebSocket connection closed (either side closed, or an error occurred).
     WebSocketClosed { conn_id: u64 },
+    /// A raw TCP stream was opened because no higher-level protocol matched.
+    TcpConnected {
+        id: u64,
+        target: String,
+        opened_at: i64,
+    },
+    /// Bytes observed on a raw TCP stream.
+    TcpData {
+        stream_id: u64,
+        chunk: Box<TcpChunk>,
+    },
+    /// A raw TCP stream closed.
+    TcpClosed { stream_id: u64 },
+    /// A DNS query was received by DNS proxy mode.
+    DnsQuery {
+        id: u64,
+        name: String,
+        query_type: u16,
+        time: i64,
+    },
+    /// A DNS response was returned to the client.
+    DnsResponse {
+        id: u64,
+        answers: Vec<String>,
+        overridden: bool,
+    },
+    /// A raw UDP request and its response from a fixed upstream target.
+    UdpExchange { exchange: Box<CapturedUdpExchange> },
 }
 
 pub(crate) fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn reserve_ids_through(id: u64) {
+    NEXT_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -68,5 +100,11 @@ mod tests {
         let id1 = next_id();
         let id2 = next_id();
         assert!(id2 > id1);
+    }
+
+    #[test]
+    fn reserving_existing_ids_moves_the_sequence_forward() {
+        reserve_ids_through(1_000_000);
+        assert!(next_id() > 1_000_000);
     }
 }

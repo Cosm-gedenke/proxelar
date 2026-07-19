@@ -1,34 +1,49 @@
 //! `proxyapi` — core library for the Proxelar MITM proxy.
 //!
-//! Provides HTTP/HTTPS forward and reverse proxy functionality with
-//! request/response interception via the [`HttpHandler`] trait.
+//! Provides HTTP/HTTPS, transparent, WireGuard, SOCKS5, DNS, and fixed-target
+//! UDP proxy functionality with request/response interception via [`HttpHandler`].
 
-// `deny` rather than `forbid` so the single audited block in `scripting`
-// (mlua's `unsafe_new`, gated behind --allow-c-modules) can opt in locally.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
+#[cfg(feature = "scripting")]
+pub mod addon;
 pub mod body;
 pub mod ca;
+pub mod content;
 #[cfg(feature = "scripting")]
 pub(crate) mod encoding;
 pub mod error;
 pub mod event;
+pub mod filter;
 pub(crate) mod handler;
 pub mod intercept;
 pub mod proxy;
 mod rewind;
+pub mod rules;
 #[cfg(feature = "scripting")]
 pub mod scripting;
+pub mod session;
 
 use body::ProxyBody;
 use hyper::{Request, Response};
 use std::net::SocketAddr;
 
+#[cfg(feature = "scripting")]
+pub use addon::{
+    discover_addons, find_addon, install_addon, AddonError, AddonHook, AddonManifest, AddonPackage,
+    ADDON_MANIFEST_FILE, ADDON_SCHEMA_VERSION,
+};
 pub use error::Error;
 pub use event::ProxyEvent;
+pub use filter::{FilterParseError, FlowFilter};
 pub use handler::{CapturingHandler, DEFAULT_BODY_CAPTURE_LIMIT};
 pub use intercept::{InterceptConfig, InterceptDecision};
-pub use proxy::{Proxy, ProxyConfig, ProxyMode, UpstreamTlsConfig};
+pub use proxy::{
+    DnsConfig, Proxy, ProxyConfig, ProxyMode, UpstreamProxyConfig, UpstreamTlsConfig,
+    WireGuardConfig,
+};
+pub use rules::{RouteRule, RouteRules, RuleError, RuleHeader, RuleOutcome};
+pub use session::{RedactionPolicy, SessionError, SessionRecorder};
 
 /// Returned by [`HttpHandler::handle_request`] to either forward or short-circuit.
 pub enum RequestOrResponse {
