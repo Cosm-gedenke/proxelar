@@ -7,6 +7,25 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add versioned native sessions, HAR import/export, curl and raw HTTP export, default secret redaction, and body truncation metadata.
+- Add shared boolean flow filters and decoded, content-aware body views across the TUI, web GUI, and REST API.
+- Add transparent, privilege-free WireGuard, SOCKS5, UDP DNS, and fixed-target raw UDP modes, raw TCP observation, and upstream HTTP CONNECT/SOCKS5 chaining.
+- Add lossless structured Protobuf wire-field and MessagePack JSON editors in the TUI and web intercept flows.
+- Add declarative local/remote maps, redirects, mocks, and request-header rules.
+- Add a bearer-token headless API for sessions, filtering, content, replay, clearing traffic, and intercept decisions.
+- Add automatic Lua hot reload, optional WebSocket frame modification, and an isolated Chromium-family proxy profile launcher.
+- Add versioned Lua addon manifests, complete SHA-256 package verification, safe atomic local installation, catalog discovery, and CLI inspect/verify/install/list/select workflows.
+
+### Changed
+
+- Restore `proxyapi`'s `#![forbid(unsafe_code)]` guarantee by removing the unsafe native-Lua-module runtime and its separate Windows distribution; Lua addons remain portable and pure Lua.
+- Use distinct ECDSA private keys for generated leaf certificates instead of reusing the root CA key.
+- Reconcile stale transfer/content encoding headers and `Content-Length` after intercepted or replayed body edits.
+- Produce SHA-256 checksums, SPDX SBOMs, and GitHub provenance attestations for release artifacts.
+- Document the session compatibility policy, capture topology, architecture, and security threat model.
+
 ## [0.4.8] - 2026-07-18
 
 ### Fixed

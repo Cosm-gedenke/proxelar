@@ -100,6 +100,8 @@ CI additionally verifies package tarball construction with `cargo package --work
 
 ## Project Structure
 
+The [architecture guide](docs/src/contributing/architecture.md) traces the listener, handler, event, session, and interface boundaries in more detail.
+
 The workspace has three crates with a strict dependency direction: `proxelar-cli` → `proxyapi` → `proxyapi_models`.
 
 | Crate | Purpose |

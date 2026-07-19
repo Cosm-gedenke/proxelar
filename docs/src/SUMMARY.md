@@ -14,11 +14,14 @@
 - [Mock or modify a local API](./guides/reverse-proxy-mocking.md)
 - [Lua recipes](./guides/lua-recipes.md)
 - [CA trust and uninstall](./guides/ca-trust.md)
+- [Sessions and export](./guides/sessions-and-export.md)
+- [Rules and headless API](./guides/rules-and-api.md)
 
 # Proxy Modes
 
 - [Forward Proxy](./proxy-modes/forward.md)
 - [Reverse Proxy](./proxy-modes/reverse.md)
+- [Transparent, WireGuard, SOCKS5, DNS, and raw UDP](./proxy-modes/transparent-socks-dns.md)
 
 # Intercept
 
@@ -34,5 +37,11 @@
 
 - [CLI Options](./cli-reference.md)
 - [Interfaces](./interfaces.md)
+- [Session format](./reference/session-format.md)
+- [Threat model](./reference/threat-model.md)
 - [Known limitations](./reference/limitations.md)
 - [Comparison with other tools](./reference/comparison.md)
+
+# Contributing
+
+- [Architecture](./contributing/architecture.md)

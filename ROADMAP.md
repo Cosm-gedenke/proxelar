@@ -16,49 +16,41 @@ It is not a promise of delivery order. It is the public source of truth for larg
 - Body capture limits for large traffic, with passthrough streaming after the configured limit.
 - Upstream TLS trust policies for default roots, extra CA files, CA-only trust, and insecure debugging.
 - HTTP/2 client connection acceptance while preserving HTTP/1.1 upstream forwarding invariants.
+- Versioned native sessions plus HAR import/export, curl export, and raw HTTP export with default secret redaction.
+- Shared expression filters across the TUI and REST API, including body/header terms and boolean operators.
+- Content-aware views with gzip, br, zstd, deflate, charsets, formatted JSON/XML/HTML/forms/multipart, CSS/JavaScript highlighting, safe raster-image rendering, Protobuf/MessagePack JSON, and bounded binary previews.
+- Transparent, WireGuard, SOCKS5, DNS, and fixed-target UDP modes, raw TCP observation, and HTTP CONNECT/SOCKS5 upstream chaining.
+- Declarative map-local, map-remote, redirect, mock, and request-header rules.
+- Bearer-token headless API for sessions, flows, replay, content views, and intercept decisions.
+- Lua hot reload and optional WebSocket frame transformation hooks.
+- Versioned Lua addon manifests, full-package SHA-256 verification, safe atomic local installation, catalog discovery, and runtime selection by addon name.
+- Distinct per-leaf TLS private keys, release checksums, SPDX SBOMs, and provenance attestations.
+- Isolated Chromium-family browser-profile launch with proxy settings preconfigured.
 
 ## Priority gaps
 
-### Persistence and interop
+### Protocol depth
 
-- Save and load captured sessions.
-- Export selected or all flows as HAR, curl commands, and raw HTTP request/response files.
-- Add redaction controls for secrets before export.
-- Define a versioned on-disk flow format.
-
-### Body handling and content views
-
-- Expose body truncation metadata clearly in flow models and both UIs.
-- Decode common content encodings such as gzip, br, zstd, and deflate.
-- Reconcile `Content-Length`, `Transfer-Encoding`, and compression headers after body edits.
-- Add safer binary-body editing behavior and richer text/binary previews.
-- Add content-aware views for JSON, XML, HTML, forms, multipart bodies, images, protobuf, and msgpack.
-
-### Capture modes and proxy topology
-
-- Add transparent/local capture for traffic that cannot easily be configured with an explicit proxy.
-- Add SOCKS5 proxy mode.
-- Add upstream proxy chaining for corporate proxies, Tor, and tool-to-tool workflows.
-- Investigate HTTP/3 and document the fallback story.
-- Add DNS inspection or rewriting only if it fits the local debugging model cleanly.
+- Preserve end-to-end HTTP/2 semantics during MITM instead of normalizing upstream requests to HTTP/1.1.
+- Investigate HTTP/3/QUIC and document a safe fallback story.
+- Add optional descriptors that give Protobuf wire fields semantic names and define raw-TCP schemas; descriptorless Protobuf and MessagePack editing is already available.
+- Expand WireGuard identity management beyond the generated single-client configuration.
 
 ### Automation and extension
 
-- Stabilize `proxyapi` as an embeddable library with complete examples.
-- Add a headless API for flows, replay, intercept decisions, scripts, and configuration.
-- Add script hot reload.
-- Add first-class rules for redirects, map-local/map-remote, mocks, and header rewrites.
+- Stabilize `proxyapi` as an embeddable library with complete end-to-end examples and semver policy.
+- Add API endpoints for live rule/script replacement and event streaming designed for non-browser clients.
+- Add hosted registry discovery and publisher signatures on top of the validated local addon catalog; package manifests and full-file integrity verification are already stable.
 
 ### Security and trust
 
-- Publish a threat model for the local CA, web GUI, scripts, and exported traffic.
-- Document CA uninstall, rotation, key storage, Android user-CA behavior, and certificate-pinning limits.
-- Add checksums or signatures for release artifacts.
-- Harden and document remote web GUI access before presenting it as a supported deployment mode.
+- Add optional TLS/mTLS authentication for deliberately remote API deployments.
+- Evaluate OS key stores for protecting the local CA private key at rest.
+- Add signed packages where each distribution channel supports them in addition to checksums and provenance.
 
 ### Onboarding and reliability
 
-- Add a `doctor` or equivalent diagnostics flow for proxy reachability, HTTPS interception, CA trust, and WebSocket capture.
-- Add one-command browser-profile launch or clear browser setup recipes.
+- Add a `doctor` diagnostics flow for proxy reachability, HTTPS interception, CA trust, and WebSocket capture.
+- Add opt-in, transactional system-proxy setup with guaranteed restoration after crashes.
 - Add UI smoke tests for web GUI states.
 - Add performance and long-running reliability tests for high-concurrency traffic and large streaming bodies.

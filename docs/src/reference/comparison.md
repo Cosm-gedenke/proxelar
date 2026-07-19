@@ -6,13 +6,13 @@ This page is intentionally practical, not promotional. Proxelar overlaps with se
 
 Use Proxelar when you want a local, scriptable, Rust-native traffic workbench with a TUI, web GUI, Lua hooks, request intercept, replay, and WebSocket frame inspection.
 
-Choose another tool when you need mature export formats, transparent capture, a large addon ecosystem, polished desktop UX, or professional security testing workflows.
+Choose another tool when you need end-to-end HTTP/2/HTTP/3 interception, a large pre-existing addon inventory, polished desktop UX, or professional security testing workflows.
 
 ## mitmproxy
 
 mitmproxy is the category default for many developers and security testers. It has mature HTTP tooling, a large addon ecosystem, strong flow persistence/export workflows, transparent/local capture modes, and broad documentation.
 
-Proxelar is smaller. Its strengths are a Rust-native implementation, a single CLI with TUI/web/terminal modes, Lua scripting, and a focused development-debugging workflow. It is not yet a mitmproxy replacement for advanced capture modes, saved flow formats, or deep content views.
+Proxelar is smaller. Its strengths are a Rust-native implementation, one CLI with terminal/TUI/web/API interfaces, portable redacted exports, Lua/rule automation, and integrity-checked addon packages with a local catalog. It is not yet a mitmproxy replacement for protocol depth, transparent-capture onboarding, or the size of mitmproxy's community addon inventory.
 
 Choose mitmproxy if you need the most mature general-purpose MITM proxy today. Choose Proxelar if you value a compact Rust-native tool with Lua transforms and are comfortable with a younger feature set.
 
@@ -20,9 +20,9 @@ Choose mitmproxy if you need the most mature general-purpose MITM proxy today. C
 
 proxyfor is the closest Rust CLI neighbor: it provides forward/reverse proxy modes, TUI/WebUI, filtering, CA install help, export formats, and portable binaries.
 
-Proxelar currently emphasizes interactive intercept/edit, replay, Lua request/response hooks, WebSocket frame inspection, and an embeddable `proxyapi` core. proxyfor currently has stronger export-oriented ergonomics.
+Proxelar emphasizes interactive intercept/edit, replay, redacted native/HAR/curl/raw exports, Lua request/response/WebSocket hooks, declarative rules, and an embeddable `proxyapi` core.
 
-Choose proxyfor if export and a simpler capture workflow are the main requirement. Choose Proxelar if traffic transformation and scripting are central.
+Choose proxyfor if its simpler capture workflow and interface fit are the main requirement. Choose Proxelar if traffic transformation, automation, portable sessions, or library embedding are central.
 
 ## Burp Suite and Caido
 

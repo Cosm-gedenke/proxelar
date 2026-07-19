@@ -37,12 +37,15 @@ Proxelar is intentionally developer-oriented: terminal-first, scriptable, Rust-n
 ## Why use it?
 
 - **One local binary** — install with Homebrew, Cargo, Docker/Podman, or GitHub releases.
-- **Three interfaces** — TUI by default, plain terminal output, or a browser GUI.
+- **Four interfaces** — TUI, plain terminal output, browser GUI, or a headless REST API.
 - **Lua scripting** — `on_request` and `on_response` hooks can rewrite, block, short-circuit, or mock traffic.
 - **Interactive intercept** — pause requests, edit method/URI/headers/body, forward, drop, or replay.
 - **HTTPS MITM** — local CA generation, per-host certificates, and a built-in certificate install page.
 - **Forward and reverse modes** — inspect configured clients or put Proxelar in front of a local service.
+- **Seven capture modes** — forward, reverse, transparent, WireGuard, SOCKS5, DNS inspection/rewrite, and fixed-target raw UDP.
 - **WebSocket inspection** — capture connections and browse frames by direction, opcode, and payload preview.
+- **Portable sessions** — save/reload native captures or import/export HAR, curl, and raw HTTP files with secret redaction.
+- **Rules and automation** — map local/remote URLs, mock and redirect requests, hot-reload Lua, or drive the bearer-token REST API.
 
 ---
 
@@ -126,6 +129,22 @@ Then call `http://127.0.0.1:8080/api/user/me` to receive the mocked response.
 
 More scripts are in [`examples/scripts/`](examples/scripts/), including auth injection, CORS headers, HTML rewriting, cookie stripping, redirects, traffic logging, and JSON body edits.
 
+Portable addons use a versioned `proxelar-addon.json` manifest with semantic
+versioning, declared hooks/native-code requirements, and SHA-256 coverage for
+every package file. Proxelar rejects traversal, symlinks, undeclared files, and
+tampered content before installation or execution:
+
+```bash
+proxelar addon verify ./examples/addons/header-tagger
+proxelar addon install ./examples/addons/header-tagger
+proxelar addon list
+proxelar --addon header-tagger
+```
+
+See [`examples/addons/header-tagger/`](examples/addons/header-tagger/) for a
+minimal distributable package. Existing manifest-free `--script` directories
+remain supported for local development.
+
 ---
 
 ## Interfaces
@@ -134,6 +153,7 @@ More scripts are in [`examples/scripts/`](examples/scripts/), including auth inj
 proxelar              # interactive TUI (default)
 proxelar -i terminal  # plain terminal output
 proxelar -i gui       # web GUI at http://localhost:8081
+proxelar -i api       # headless REST API at http://localhost:8081
 ```
 
 Common options:
@@ -144,6 +164,10 @@ proxelar -b 0.0.0.0 -p 9090                         # custom bind/port
 proxelar --script examples/scripts/block_domain.lua  # with a Lua script
 proxelar --body-capture-limit 1048576                # cap captured/editable body bytes
 proxelar --upstream-trust default+ca:/path/ca.pem    # trust an extra upstream CA
+proxelar --save-session debug.proxelar.json           # save on Ctrl+C
+proxelar -i gui --launch-browser                      # isolated Chromium proxy profile
+proxelar -m wireguard -b 0.0.0.0 -p 51820 \
+  --wireguard-endpoint 192.168.1.10:51820             # mobile/IoT capture
 ```
 
 <details>
@@ -151,16 +175,25 @@ proxelar --upstream-trust default+ca:/path/ca.pem    # trust an extra upstream C
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i, --interface` | `terminal` · `tui` · `gui` | `tui` |
-| `-m, --mode` | `forward` · `reverse` | `forward` |
+| `-i, --interface` | `terminal` · `tui` · `gui` · `api` | `tui` |
+| `-m, --mode` | `forward` · `reverse` · `transparent` · `wireguard` · `socks5` · `dns` · `udp` | `forward` |
 | `-p, --port` | Listening port | `8080` |
 | `-b, --addr` | Bind address | `127.0.0.1` |
-| `-t, --target` | Upstream target (required for reverse) | — |
+| `-t, --target` | Upstream URI for reverse, `HOST:PORT` for UDP, or transparent fallback | — |
 | `--gui-port` | Web GUI port | `8081` |
 | `--ca-dir` | CA certificate directory | `~/.proxelar` |
-| `-s, --script` | Lua script for request/response hooks | — |
+| `-s, --script` | Lua script file or addon directory (`init.lua`) | — |
+| `--addon` | Load a validated installed addon by name | — |
+| `--addons-dir` | Local addon catalog used by runtime and `addon` commands | `CA_DIR/addons` |
 | `--body-capture-limit` | Maximum body bytes buffered for capture/editing; use `free`, `unlimited`, or `none` for unlimited | `free` |
 | `--upstream-trust` | Upstream TLS trust policy: `default`, `default+ca:/path/ca.pem`, `ca-only:/path/ca.pem`, or `insecure` | `default` |
+| `--upstream-proxy` | Chain through `http://HOST:PORT` or `socks5://HOST:PORT` | — |
+| `--load-session`, `--import-har` | Load prior traffic before capture | — |
+| `--save-session`, `--export-har`, `--export-curl`, `--export-raw` | Write captures on clean shutdown | — |
+| `--rules`, `--map-local`, `--map-remote` | Declarative routing, mocks, redirects, and rewrites | — |
+| `--api-token` | Fixed bearer token for the GUI/headless API; random when omitted | random |
+| `--launch-browser` | Launch an isolated Chromium-family profile using the proxy | off |
+| `--wireguard-endpoint` | Public/LAN `HOST:PORT` written to the generated client config | derived from bind route |
 
 </details>
 
@@ -172,8 +205,8 @@ proxelar --upstream-trust default+ca:/path/ca.pem    # trust an extra upstream C
 
 | Tool | Best fit | Proxelar tradeoff |
 |------|----------|-------------------|
-| mitmproxy | Mature general-purpose MITM proxy with a large addon ecosystem, transparent/local capture modes, rich flow formats, and years of protocol hardening. | Proxelar is smaller and Rust-native, with Lua scripting and TUI/web interfaces, but it does not yet match mitmproxy's depth. |
-| proxyfor | Lightweight Rust proxy with TUI/WebUI and export-oriented workflows. | Proxelar emphasizes Lua transforms, interactive intercept, replay, and an embeddable core; proxyfor currently has stronger export ergonomics. |
+| mitmproxy | Mature general-purpose MITM proxy with a large addon ecosystem, transparent/local capture modes, rich flow formats, and years of protocol hardening. | Proxelar is smaller and Rust-native, with integrity-checked Lua addon packages and TUI/web interfaces, but it does not yet match mitmproxy's protocol depth or community inventory. |
+| proxyfor | Lightweight Rust proxy with TUI/WebUI and export-oriented workflows. | Proxelar adds interactive interception, replay, portable/redacted exports, Lua transforms, rules, and an embeddable core. |
 | Burp Suite / Caido | Professional web security testing, scanning, collaboration, and deep manual testing workflows. | Proxelar is not a security suite. It is better suited to local debugging, scripting, and development workflows. |
 | Charles / Proxyman / HTTP Toolkit | Polished desktop app experience for inspecting app traffic. | Proxelar is terminal-first and scriptable, with less desktop polish but a simpler open-source CLI workflow. |
 
@@ -183,11 +216,12 @@ See the [full comparison](https://proxelar.micheletti.io/reference/comparison.ht
 
 ## Current limitations
 
-Proxelar is usable today, but some mature proxy workflows are still on the roadmap:
+Proxelar is usable today, but it intentionally has a narrower scope than a full security suite:
 
-- Captured sessions are in memory; HAR, curl, raw-flow export, and session reload are not implemented yet.
-- Body views and editors are byte-oriented; gzip/br/zstd decoding, charset handling, and richer pretty views are limited.
-- Transparent/local capture, SOCKS5 mode, upstream proxy chaining, and DNS inspection are not implemented.
+- HTTP/2 clients are accepted, but HTTP/2 MITM streams are normalized and forwarded upstream as HTTP/1.1. HTTP/3/QUIC interception is not supported.
+- Transparent mode needs OS-level destination preservation (for example Linux TPROXY) unless `--target HOST:PORT` is supplied. Proxelar does not install firewall rules for you.
+- Generic TCP streams are captured as directional chunks, and fixed-target or WireGuard UDP traffic records request/response datagrams. Protobuf has a lossless wire-field JSON editor and MessagePack has a JSON editor; descriptor-backed field names and raw-TCP schemas are not yet available.
+- WireGuard mode currently generates one client identity per CA directory. Proxelar does not modify system proxy settings; `--launch-browser` uses a reversible, isolated browser profile instead.
 - HTTPS interception requires trusting Proxelar's local CA. Certificate-pinned apps and many Android apps will not trust user-installed CAs.
 - Remote web GUI use is not a hardened multi-user deployment mode; keep it local or tunnel it carefully.
 
@@ -204,6 +238,8 @@ Full documentation: **[proxelar.micheletti.io](https://proxelar.micheletti.io)**
 - [Mock or modify a local API](https://proxelar.micheletti.io/guides/reverse-proxy-mocking.html)
 - [Lua scripting API](https://proxelar.micheletti.io/scripting/api-reference.html)
 - [CA trust and uninstall](https://proxelar.micheletti.io/guides/ca-trust.html)
+- [Sessions and export](https://proxelar.micheletti.io/guides/sessions-and-export.html)
+- [Rules and headless API](https://proxelar.micheletti.io/guides/rules-and-api.html)
 
 ---
 
