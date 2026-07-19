@@ -77,7 +77,14 @@
             <table id="headers-table" class="headers-table">
                 <tbody id="headers-body"></tbody>
             </table>
-            <div class="intercept-section-label">Body</div>
+            <div class="intercept-section-label">Body
+                <select id="edit-body-mode" class="body-mode" aria-label="Body editor encoding">
+                    <option value="text">Text</option>
+                    <option value="hex">Hex bytes</option>
+                    <option value="protobuf">Protobuf fields (JSON)</option>
+                    <option value="messagepack">MessagePack (JSON)</option>
+                </select>
+            </div>
             <textarea id="edit-body" class="edit-body" placeholder="Request body..."></textarea>
         </div>
         <div class="intercept-footer">

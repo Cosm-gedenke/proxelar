@@ -1,4 +1,5 @@
 (function() {
+    const apiToken = __WS_TOKEN_JSON__;
     const tbody = document.getElementById('requests-body');
     const detailPanel = document.getElementById('detail-panel');
     const detailContent = document.getElementById('detail-content');
@@ -16,6 +17,7 @@
     const headersBody = document.getElementById('headers-body');
     const addHeaderBtn = document.getElementById('add-header-btn');
     const editBody = document.getElementById('edit-body');
+    const editBodyMode = document.getElementById('edit-body-mode');
     const forwardBtn = document.getElementById('forward-btn');
     const dropBtn = document.getElementById('drop-btn');
 
@@ -67,21 +69,63 @@
     // pending flows: Map<id, request>
     let pendingRequests = new Map();
 
-    let selectedIdx = null;
+    let selectedFlowId = null;
     let activeTab = 'request';
     let interceptEnabled = false;
     let currentInterceptId = null;
+    let editorOriginalBytes = [];
+    let editorStructured = null;
     let ws = null;
 
     // WebSocket inspection state
     // Map<conn_id, { request, response, frames: [], closed }>
     let wsFlows = new Map();
     let selectedWsConnId = null;
+    let tcpStreams = new Map();
+    let dnsExchanges = new Map();
+    let udpExchanges = new Map();
+    let selectedAuxKey = null;
+    let filterMatches = null;
+    let filterGeneration = 0;
+    let filterTimer = null;
 
     // ─── WebSocket ───────────────────────────────────────────────────────────
 
+    async function loadSession() {
+        try {
+            const response = await fetch('/api/v1/session?token=' + encodeURIComponent(apiToken));
+            if (!response.ok) return;
+            const session = await response.json();
+            requests = (session.flows || []).slice(-MAX_REQUESTS);
+            wsFlows.clear();
+            (session.websockets || []).forEach(function(flow) {
+                wsFlows.set(flow.id, {
+                    request: flow.request,
+                    response: flow.response,
+                    frames: flow.frames || [],
+                    closed: !!flow.closed,
+                });
+            });
+            tcpStreams.clear();
+            (session.tcp_streams || []).forEach(function(stream) {
+                tcpStreams.set(stream.id, stream);
+            });
+            dnsExchanges.clear();
+            (session.dns_exchanges || []).forEach(function(exchange) {
+                dnsExchanges.set(exchange.id, exchange);
+            });
+            udpExchanges.clear();
+            (session.udp_exchanges || []).forEach(function(exchange) {
+                udpExchanges.set(exchange.id, exchange);
+            });
+            scheduleTableUpdate();
+        } catch (error) {
+            console.warn('Could not load capture history:', error);
+        }
+    }
+
     function connect() {
-        ws = new WebSocket('ws://' + location.host + '/ws?token=__WS_TOKEN__');
+        ws = new WebSocket('ws://' + location.host + '/ws?token=' + encodeURIComponent(apiToken));
 
         ws.onopen = function() {
             statusEl.textContent = 'Connected';
@@ -102,27 +146,40 @@
                     const r = event.RequestComplete;
                     // If this was pending, promote it; otherwise append.
                     pendingRequests.delete(r.id);
+                    if (currentInterceptId === r.id) {
+                        currentInterceptId = null;
+                        interceptPanel.classList.add('hidden');
+                        forwardBtn.disabled = false;
+                    }
                     requests.push(r);
                     if (requests.length > MAX_REQUESTS) {
                         const toRemove = requests.length - MAX_REQUESTS;
                         requests = requests.slice(toRemove);
-                        if (selectedIdx !== null) {
-                            selectedIdx = Math.max(0, selectedIdx - toRemove);
+                        if (selectedFlowId !== null && !requests.some(function(flow) { return flow.id === selectedFlowId; })) {
+                            selectedFlowId = null;
                         }
                     }
-                    renderTable();
+                    scheduleTableUpdate();
                 } else if (event.RequestIntercepted) {
                     const r = event.RequestIntercepted;
+                    r.request._editor = r.editor || null;
                     pendingRequests.set(r.id, r.request);
-                    renderTable();
+                    scheduleTableUpdate();
                     updateInterceptBtn();
                 } else if (event.InterceptStatus) {
                     interceptEnabled = event.InterceptStatus.enabled;
                     updateInterceptBtn();
+                } else if (event.EditorError) {
+                    if (currentInterceptId === event.EditorError.id) {
+                        forwardBtn.disabled = false;
+                        editBody.setCustomValidity(event.EditorError.message || 'Invalid structured body');
+                        editBody.reportValidity();
+                        editBody.focus();
+                    }
                 } else if (event.WebSocketConnected) {
                     const r = event.WebSocketConnected;
                     wsFlows.set(r.id, { request: r.request, response: r.response, frames: [], closed: false });
-                    renderTable();
+                    scheduleTableUpdate();
                 } else if (event.WebSocketFrame) {
                     const r = event.WebSocketFrame;
                     const flow = wsFlows.get(r.conn_id);
@@ -133,6 +190,7 @@
                         if (selectedWsConnId === r.conn_id && activeTab === 'frames') {
                             appendWsFrame(r.frame);
                         }
+                        scheduleTableUpdate();
                     }
                 } else if (event.WebSocketClosed) {
                     const flow = wsFlows.get(event.WebSocketClosed.conn_id);
@@ -141,8 +199,59 @@
                         if (selectedWsConnId === event.WebSocketClosed.conn_id) {
                             updateWsClosedBadge();
                         }
-                        renderTable();
+                        scheduleTableUpdate();
                     }
+                } else if (event.TcpConnected) {
+                    const r = event.TcpConnected;
+                    tcpStreams.set(r.id, {
+                        id: r.id,
+                        target: r.target,
+                        opened_at: r.opened_at,
+                        chunks: [],
+                        closed: false,
+                    });
+                    scheduleTableUpdate();
+                } else if (event.TcpData) {
+                    const r = event.TcpData;
+                    const stream = tcpStreams.get(r.stream_id);
+                    if (stream && stream.chunks.length < 10000) {
+                        stream.chunks.push(r.chunk);
+                        if (selectedAuxKey === 'tcp:' + r.stream_id) openAuxDetail('tcp', stream);
+                        scheduleTableUpdate();
+                    }
+                } else if (event.TcpClosed) {
+                    const stream = tcpStreams.get(event.TcpClosed.stream_id);
+                    if (stream) {
+                        stream.closed = true;
+                        scheduleTableUpdate();
+                    }
+                } else if (event.DnsQuery) {
+                    const r = event.DnsQuery;
+                    dnsExchanges.set(r.id, {
+                        id: r.id,
+                        name: r.name,
+                        query_type: r.query_type,
+                        time: r.time,
+                        answers: [],
+                        overridden: false,
+                        completed: false,
+                    });
+                    scheduleTableUpdate();
+                } else if (event.DnsResponse) {
+                    const r = event.DnsResponse;
+                    const exchange = dnsExchanges.get(r.id);
+                    if (exchange) {
+                        exchange.answers = r.answers || [];
+                        exchange.overridden = !!r.overridden;
+                        exchange.completed = true;
+                        if (selectedAuxKey === 'dns:' + r.id) openAuxDetail('dns', exchange);
+                        scheduleTableUpdate();
+                    }
+                } else if (event.UdpExchange) {
+                    const exchange = event.UdpExchange.exchange;
+                    udpExchanges.set(exchange.id, exchange);
+                    if (selectedAuxKey === 'udp:' + exchange.id) openAuxDetail('udp', exchange);
+                    scheduleTableUpdate();
                 }
             } catch(err) {
                 console.error('Parse error:', err);
@@ -154,6 +263,56 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(msg));
         }
+    }
+
+    function emptyFilterMatches() {
+        return {
+            flowIds: new Set(),
+            websocketIds: new Set(),
+            tcpStreamIds: new Set(),
+            dnsExchangeIds: new Set(),
+            udpExchangeIds: new Set(),
+        };
+    }
+
+    async function refreshFilter() {
+        const expression = searchInput.value.trim();
+        const generation = ++filterGeneration;
+        if (!expression) {
+            filterMatches = null;
+            renderTable();
+            return;
+        }
+        filterMatches = emptyFilterMatches();
+        try {
+            const response = await fetch(
+                '/api/v1/filter?token=' + encodeURIComponent(apiToken) + '&filter=' + encodeURIComponent(expression)
+            );
+            if (!response.ok) throw new Error(await response.text());
+            const result = await response.json();
+            if (generation !== filterGeneration) return;
+            filterMatches = {
+                flowIds: new Set(result.flow_ids || []),
+                websocketIds: new Set(result.websocket_ids || []),
+                tcpStreamIds: new Set(result.tcp_stream_ids || []),
+                dnsExchangeIds: new Set(result.dns_exchange_ids || []),
+                udpExchangeIds: new Set(result.udp_exchange_ids || []),
+            };
+        } catch (error) {
+            if (generation !== filterGeneration) return;
+            console.warn('Invalid or unavailable flow filter:', error);
+            filterMatches = emptyFilterMatches();
+        }
+        renderTable();
+    }
+
+    function scheduleTableUpdate() {
+        if (!searchInput.value.trim()) {
+            renderTable();
+            return;
+        }
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(refreshFilter, 100);
     }
 
     // ─── Intercept UI ────────────────────────────────────────────────────────
@@ -193,12 +352,16 @@
         headersBody.innerHTML = '';
         if (request.headers) {
             for (const [k, v] of Object.entries(request.headers)) {
-                addHeaderRow(k, v);
+                if (Array.isArray(v)) {
+                    v.forEach(function(value) { addHeaderRow(k, value); });
+                } else {
+                    addHeaderRow(k, v);
+                }
             }
         }
 
         // Populate body
-        editBody.value = tryDecodeBody(request.body) || '';
+        setBodyEditor(request.body, request._editor);
 
         interceptPanel.classList.remove('hidden');
         detailPanel.classList.add('hidden');
@@ -236,31 +399,121 @@
 
     addHeaderBtn.onclick = function() { addHeaderRow('', ''); };
 
+    function bytesFromBody(body) {
+        if (Array.isArray(body)) return body.slice();
+        if (typeof body === 'string') return Array.from(new TextEncoder().encode(bodyToString(body)));
+        return [];
+    }
+
+    function formatHex(bytes) {
+        return bytes.map(function(byte, index) {
+            const prefix = index === 0 ? '' : (index % 16 === 0 ? '\n' : ' ');
+            return prefix + byte.toString(16).padStart(2, '0');
+        }).join('');
+    }
+
+    function parseHex(value) {
+        const compact = value.replace(/\s/g, '');
+        if (compact.length % 2 !== 0 || /[^0-9a-f]/i.test(compact)) return null;
+        const bytes = [];
+        for (let index = 0; index < compact.length; index += 2) {
+            bytes.push(parseInt(compact.slice(index, index + 2), 16));
+        }
+        return bytes;
+    }
+
+    function setBodyEditor(body, structured) {
+        const bytes = bytesFromBody(body);
+        editorOriginalBytes = bytes;
+        editorStructured = structured || null;
+        editBody.setCustomValidity('');
+        if (editorStructured) {
+            editBody.value = editorStructured.text || '';
+            editBodyMode.value = editorStructured.format;
+            return;
+        }
+        try {
+            editBody.value = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+            editBodyMode.value = 'text';
+        } catch (error) {
+            editBody.value = formatHex(bytes);
+            editBodyMode.value = 'hex';
+        }
+    }
+
+    editBodyMode.onchange = function() {
+        editBody.setCustomValidity('');
+        if (editBodyMode.value === 'protobuf' || editBodyMode.value === 'messagepack') {
+            if (editorStructured && editorStructured.format === editBodyMode.value) {
+                editBody.value = editorStructured.text || '';
+                return;
+            }
+            editBodyMode.value = 'hex';
+            editBody.value = formatHex(editorOriginalBytes);
+            return;
+        }
+        if (editBodyMode.value === 'hex') {
+            editBody.value = formatHex(editorOriginalBytes);
+            return;
+        }
+        try {
+            editBody.value = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(editorOriginalBytes));
+        } catch (error) {
+            editBodyMode.value = 'hex';
+            editBody.value = formatHex(editorOriginalBytes);
+            return;
+        }
+    };
+
+    function editedBody() {
+        if (editBodyMode.value === 'text') return editBody.value;
+        if (editBodyMode.value === 'protobuf' || editBodyMode.value === 'messagepack') {
+            try {
+                JSON.parse(editBody.value);
+            } catch (error) {
+                editBody.focus();
+                editBody.setCustomValidity('Structured bodies must be valid JSON: ' + error.message);
+                editBody.reportValidity();
+                return null;
+            }
+            editBody.setCustomValidity('');
+            return { format: editBodyMode.value, text: editBody.value };
+        }
+        const bytes = parseHex(editBody.value);
+        if (bytes === null) {
+            editBody.focus();
+            editBody.setCustomValidity('Hex bodies must contain pairs of hexadecimal digits');
+            editBody.reportValidity();
+            return null;
+        }
+        editBody.setCustomValidity('');
+        return { bytes: bytes };
+    }
+
     function collectEdits() {
-        const headers = {};
+        const headers = [];
         headersBody.querySelectorAll('tr').forEach(function(tr) {
             const k = tr.querySelector('.header-name').value.trim();
             const v = tr.querySelector('.header-value').value;
-            if (k) headers[k] = v;
+            if (k) headers.push({ name: k, value: v });
         });
+        const body = editedBody();
+        if (body === null) return null;
         return {
             id: currentInterceptId,
             method: editMethod.value,
             uri: editUri.value.trim(),
             headers: headers,
-            body: editBody.value,
+            body: body,
         };
     }
 
     forwardBtn.onclick = function() {
         if (currentInterceptId === null) return;
         const edits = collectEdits();
+        if (!edits) return;
+        forwardBtn.disabled = true;
         sendWs({ type: 'Modified', ...edits });
-        pendingRequests.delete(currentInterceptId);
-        currentInterceptId = null;
-        interceptPanel.classList.add('hidden');
-        updateInterceptBtn();
-        renderTable();
     };
 
     dropBtn.onclick = function() {
@@ -359,8 +612,27 @@
             rows.push({ ws: true, id: id, request: flow.request, wsFlow: flow });
         });
 
+        tcpStreams.forEach(function(stream, id) {
+            rows.push({ tcp: true, id: id, stream: stream });
+        });
+
+        dnsExchanges.forEach(function(exchange, id) {
+            rows.push({ dns: true, id: id, exchange: exchange });
+        });
+
+        udpExchanges.forEach(function(exchange, id) {
+            rows.push({ udp: true, id: id, exchange: exchange });
+        });
+
         return rows.filter(function(r) {
-            return rowMatchesSearch(r, col, val);
+            if (!rawSearch) return true;
+            if (r.pending) return rowMatchesSearch(r, col, val);
+            if (!filterMatches) return false;
+            if (r.ws) return filterMatches.websocketIds.has(r.id);
+            if (r.tcp) return filterMatches.tcpStreamIds.has(r.id);
+            if (r.dns) return filterMatches.dnsExchangeIds.has(r.id);
+            if (r.udp) return filterMatches.udpExchangeIds.has(r.id);
+            return filterMatches.flowIds.has(r.id);
         });
     }
 
@@ -371,7 +643,74 @@
         filtered.forEach(function(r, i) {
             const tr = document.createElement('tr');
 
-            if (r.ws) {
+            if (r.udp) {
+                const exchange = r.exchange;
+                const requestSize = bodySize(exchange.request);
+                const responseSize = bodySize(exchange.response);
+                const complete = !!exchange.response_received;
+                if (selectedAuxKey === 'udp:' + r.id) tr.className = 'selected';
+                tr.innerHTML =
+                    '<td class="col-time">' + formatTime(exchange.time) + '</td>' +
+                    '<td data-proto="udp">UDP</td>' +
+                    '<td data-method="datagram">DGRAM</td>' +
+                    '<td>' + escapeHtml(exchange.target) + '</td>' +
+                    '<td class="col-path">' + escapeHtml(exchange.client) + '</td>' +
+                    '<td data-status="' + (complete ? '2xx' : 'pending') + '">' + (complete ? 'complete' : 'no-resp') + '</td>' +
+                    '<td class="col-type" data-type="bin">binary</td>' +
+                    '<td data-size="' + sizeCategory(requestSize + responseSize) + '">' + formatSize(requestSize + responseSize) + '</td>' +
+                    '<td>-</td>';
+                tr.onclick = function() {
+                    selectedFlowId = null;
+                    selectedWsConnId = null;
+                    selectedAuxKey = 'udp:' + r.id;
+                    openAuxDetail('udp', exchange);
+                    renderTable();
+                };
+            } else if (r.tcp) {
+                const stream = r.stream;
+                const bytes = stream.chunks.reduce(function(total, chunk) {
+                    return total + bodySize(chunk.payload);
+                }, 0);
+                if (selectedAuxKey === 'tcp:' + r.id) tr.className = 'selected';
+                tr.innerHTML =
+                    '<td class="col-time">' + formatTime(stream.opened_at) + '</td>' +
+                    '<td data-proto="tcp">TCP</td>' +
+                    '<td data-method="stream">STREAM</td>' +
+                    '<td>' + escapeHtml(stream.target) + '</td>' +
+                    '<td class="col-path">-</td>' +
+                    '<td data-status="' + (stream.closed ? 'other' : '2xx') + '">' + (stream.closed ? 'closed' : 'live') + '</td>' +
+                    '<td class="col-type" data-type="bin">binary</td>' +
+                    '<td data-size="' + sizeCategory(bytes) + '">' + formatSize(bytes) + '</td>' +
+                    '<td>' + stream.chunks.length + 'ch</td>';
+                tr.onclick = function() {
+                    selectedFlowId = null;
+                    selectedWsConnId = null;
+                    selectedAuxKey = 'tcp:' + r.id;
+                    openAuxDetail('tcp', stream);
+                    renderTable();
+                };
+            } else if (r.dns) {
+                const exchange = r.exchange;
+                const state = !exchange.completed ? 'pending' : (exchange.overridden ? 'override' : 'upstream');
+                if (selectedAuxKey === 'dns:' + r.id) tr.className = 'selected';
+                tr.innerHTML =
+                    '<td class="col-time">' + formatTime(exchange.time) + '</td>' +
+                    '<td data-proto="dns">DNS</td>' +
+                    '<td data-method="dns">' + dnsQueryType(exchange.query_type) + '</td>' +
+                    '<td>' + escapeHtml(exchange.name) + '</td>' +
+                    '<td class="col-path">-</td>' +
+                    '<td data-status="' + (exchange.overridden ? '3xx' : '2xx') + '">' + state + '</td>' +
+                    '<td class="col-type" data-type="other">dns</td>' +
+                    '<td>' + (exchange.answers || []).length + 'ans</td>' +
+                    '<td>-</td>';
+                tr.onclick = function() {
+                    selectedFlowId = null;
+                    selectedWsConnId = null;
+                    selectedAuxKey = 'dns:' + r.id;
+                    openAuxDetail('dns', exchange);
+                    renderTable();
+                };
+            } else if (r.ws) {
                 const flow = r.wsFlow;
                 const uri = parseUri(r.request.uri || '');
                 const proto = getProto(r.request.uri || '', true).toLowerCase();
@@ -394,8 +733,9 @@
                     '<td data-dur="' + durationCategory(r.request.time, resp ? resp.time : null) + '">' + duration + '</td>';
                 tr.onclick = (function(connId, flowRef) {
                     return function() {
-                        selectedIdx = null;
+                        selectedFlowId = null;
                         selectedWsConnId = connId;
+                        selectedAuxKey = null;
                         openWsDetail(flowRef);
                         renderTable();
                     };
@@ -419,11 +759,13 @@
                     openInterceptEditor(r.id, r.request);
                 };
             } else {
-                if (i === selectedIdx) tr.className = 'selected';
+                if (selectedFlowId === r.id) tr.className = 'selected';
                 const uri = parseUri(r.request.uri || '');
                 const proto = getProto(r.request.uri || '', false).toLowerCase();
                 const method = (r.request.method || '').toLowerCase();
-                const bodyBytes = bodySize(r.response.body);
+                const bodyBytes = (r.response.body_metadata && r.response.body_metadata.total_seen)
+                    || bodySize(r.response.body);
+                const truncatedMark = r.response.body_metadata && r.response.body_metadata.truncated ? ' ⚠' : '';
                 const ct = getContentType(r.response.headers);
                 const duration = formatDuration(r.request.time, r.response.time);
                 tr.innerHTML =
@@ -434,7 +776,7 @@
                     '<td class="col-path">' + escapeHtml(uri.path) + '</td>' +
                     '<td data-status="' + statusCategory(r.response.status) + '">' + r.response.status + '</td>' +
                     '<td class="col-type" data-type="' + typeCategory(ct) + '">' + escapeHtml(ct) + '</td>' +
-                    '<td class="td-with-action" data-size="' + sizeCategory(bodyBytes) + '">' + formatSize(bodyBytes) +
+                    '<td class="td-with-action" data-size="' + sizeCategory(bodyBytes) + '">' + formatSize(bodyBytes) + truncatedMark +
                         '<button class="btn-row-replay" title="Replay">&#8635; Replay</button>' +
                     '</td>' +
                     '<td data-dur="' + durationCategory(r.request.time, r.response.time) + '">' + duration + '</td>';
@@ -446,18 +788,19 @@
                             method: row.request.method || 'GET',
                             uri: row.request.uri || '',
                             headers: row.request.headers || {},
-                            body: bodyToString(row.request.body),
+                            body: encodedWireBody(row.request.body),
                         });
                     };
                 })(r);
-                tr.onclick = (function(idx, row) {
+                tr.onclick = (function(row) {
                     return function() {
-                        selectedIdx = idx;
+                        selectedFlowId = row.id;
                         selectedWsConnId = null;
+                        selectedAuxKey = null;
                         showDetail(row);
                         renderTable();
                     };
-                })(i, r);
+                })(r);
             }
 
             tbody.appendChild(tr);
@@ -474,6 +817,8 @@
 
     function renderDetail(r) {
         let content = '';
+        let body = null;
+        let side = activeTab === 'request' ? 'request' : 'response';
         if (activeTab === 'request') {
             content = (r.request.method || '') + ' ' + (r.request.uri || '') + '\n\n';
             if (r.request.headers) {
@@ -481,9 +826,7 @@
                     content += key + ': ' + val + '\n';
                 }
             }
-            if (r.request.body) {
-                content += '\n' + tryDecodeBody(r.request.body);
-            }
+            body = r.request.body;
         } else {
             content = (r.response.status || '') + '\n\n';
             if (r.response.headers) {
@@ -491,10 +834,119 @@
                     content += key + ': ' + val + '\n';
                 }
             }
-            if (r.response.body) {
-                content += '\n' + tryDecodeBody(r.response.body);
-            }
+            body = r.response.body;
         }
+        detailContent.textContent = content;
+        if (!body) return;
+
+        const renderKey = r.id + ':' + side + ':' + Date.now();
+        detailContent.dataset.renderKey = renderKey;
+        fetch('/api/v1/flows/' + r.id + '/content/' + side + '?token=' + encodeURIComponent(apiToken))
+            .then(function(response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(function(view) {
+                if (detailContent.dataset.renderKey !== renderKey) return;
+                let banner = '\n[' + view.kind + ' · ' + formatSize(view.decoded_len) + ']';
+                if (view.truncated) {
+                    banner += ' [truncated · observed ' + formatSize(view.total_seen) + ']';
+                }
+                renderContentView(content + banner + '\n', view);
+            })
+            .catch(function() {
+                if (detailContent.dataset.renderKey === renderKey) {
+                    detailContent.textContent = content + '\n' + tryDecodeBody(body);
+                }
+            });
+    }
+
+    function renderContentView(prefix, view) {
+        detailContent.textContent = prefix;
+        const text = view.text || '';
+        if (view.kind === 'Image' && view.image_media_type && view.image_base64) {
+            const image = document.createElement('img');
+            image.className = 'content-image-preview';
+            image.alt = view.image_media_type + ' response preview';
+            image.src = 'data:' + view.image_media_type + ';base64,' + view.image_base64;
+            detailContent.appendChild(image);
+            return;
+        }
+        let pattern = null;
+        const jsonLike = view.kind === 'JSON' || view.kind === 'Protobuf' || view.kind === 'MessagePack';
+        if (jsonLike) {
+            pattern = /("(?:\\.|[^"\\])*"\s*:)|("(?:\\.|[^"\\])*")|\b(true|false|null)\b|-?\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b/gi;
+        } else if (view.kind === 'XML' || view.kind === 'HTML') {
+            pattern = /<\/?[^>]+>/g;
+        } else if (view.kind === 'CSS' || view.kind === 'JavaScript') {
+            pattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|\b(true|false|null|undefined)\b|-?\b\d+(?:\.\d+)?\b/g;
+        }
+        if (!pattern) {
+            detailContent.appendChild(document.createTextNode(text));
+            return;
+        }
+
+        let cursor = 0;
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            detailContent.appendChild(document.createTextNode(text.slice(cursor, match.index)));
+            const token = document.createElement('span');
+            const value = match[0];
+            if (jsonLike && /^".*"\s*:$/.test(value)) token.className = 'syntax-key';
+            else if (/^["']/.test(value)) token.className = 'syntax-string';
+            else if (/^(true|false|null|undefined)$/i.test(value)) token.className = 'syntax-literal';
+            else if (/^-?\d/.test(value)) token.className = 'syntax-number';
+            else token.className = 'syntax-key';
+            token.textContent = value;
+            detailContent.appendChild(token);
+            cursor = pattern.lastIndex;
+        }
+        detailContent.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+
+    function openAuxDetail(kind, item) {
+        document.getElementById('frames-tab').classList.add('hidden');
+        document.querySelector('[data-tab="response"]').classList.add('hidden');
+        tabs.forEach(function(tab) { tab.classList.remove('active'); });
+        document.querySelector('[data-tab="request"]').classList.add('active');
+        activeTab = 'request';
+        detailPanel.classList.remove('hidden');
+        interceptPanel.classList.add('hidden');
+
+        if (kind === 'dns') {
+            const source = item.overridden ? 'local override' : 'upstream resolver';
+            const answers = (item.answers || []).length ? item.answers.join('\n') : 'No IP answers';
+            detailContent.textContent = dnsQueryType(item.query_type) + ' ' + item.name + '\n' +
+                'Source: ' + source + '\n' +
+                'State: ' + (item.completed ? 'complete' : 'pending') + '\n\n' + answers;
+            return;
+        }
+
+        if (kind === 'udp') {
+            const request = Array.isArray(item.request) ? item.request : [];
+            const response = Array.isArray(item.response) ? item.response : [];
+            detailContent.textContent = 'Client: ' + item.client + '\n' +
+                'Target: ' + item.target + '\n' +
+                'Request: ' + request.length + 'B' + (item.request_truncated ? ' [capture limit]' : '') + '\n' +
+                bytesPreview(request) + '\n\n' +
+                'Response: ' + response.length + 'B' + (item.response_truncated ? ' [capture limit]' : '') + '\n' +
+                bytesPreview(response);
+            return;
+        }
+
+        let content = 'Target: ' + item.target + '\n' +
+            'State: ' + (item.closed ? 'closed' : 'live') + ' · ' + item.chunks.length + ' chunks\n\n';
+        item.chunks.forEach(function(chunk) {
+            const direction = chunk.direction === 'ClientToServer' ? '↑' : '↓';
+            const payload = Array.isArray(chunk.payload) ? chunk.payload : [];
+            const decoded = new TextDecoder().decode(new Uint8Array(payload));
+            const printable = !/[\u0000-\u0008\u000e-\u001f]/.test(decoded);
+            const preview = printable ? decoded.slice(0, 160) : payload.slice(0, 48).map(function(byte) {
+                return byte.toString(16).padStart(2, '0');
+            }).join(' ');
+            content += direction + ' ' + formatTime(chunk.time) + ' ' + payload.length + 'B' +
+                (chunk.truncated ? ' [capture limit]' : '') + ' ' + preview + '\n';
+        });
         detailContent.textContent = content;
     }
 
@@ -617,6 +1069,11 @@
         return 'proto-' + proto.toLowerCase();
     }
 
+    function dnsQueryType(queryType) {
+        const names = { 1: 'A', 2: 'NS', 5: 'CNAME', 12: 'PTR', 15: 'MX', 16: 'TXT', 28: 'AAAA', 33: 'SRV', 65: 'HTTPS' };
+        return names[queryType] || 'TYPE' + queryType;
+    }
+
     function getContentType(headers) {
         if (!headers) return '[no content]';
         const ct = headers['content-type'];
@@ -701,6 +1158,20 @@
         return 0;
     }
 
+    function bytesPreview(bytes) {
+        if (!bytes.length) return '[no payload]';
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        try {
+            const text = decoder.decode(new Uint8Array(bytes));
+            if (!/[\u0000-\u0008\u000e-\u001f]/.test(text)) return text.slice(0, 512);
+        } catch (error) {
+            // Fall through to an exact hexadecimal preview.
+        }
+        return bytes.slice(0, 512).map(function(byte) {
+            return byte.toString(16).padStart(2, '0');
+        }).join(' ');
+    }
+
     function bodyToString(body) {
         if (!body) return '';
         if (Array.isArray(body)) {
@@ -710,6 +1181,10 @@
             try { return atob(body); } catch(e) { return body; }
         }
         return String(body);
+    }
+
+    function encodedWireBody(body) {
+        return Array.isArray(body) ? { bytes: body } : bodyToString(body);
     }
 
     function tryDecodeBody(body) {
@@ -730,9 +1205,11 @@
                 const flow = wsFlows.get(selectedWsConnId);
                 if (flow) renderWsFrameList(flow);
             } else {
-                const filtered = getFiltered().filter(function(r) { return !r.pending && !r.ws; });
-                if (selectedIdx !== null && filtered[selectedIdx]) {
-                    renderDetail(filtered[selectedIdx]);
+                const selected = getFiltered().find(function(row) {
+                    return !row.pending && !row.ws && !row.tcp && !row.dns && !row.udp && row.id === selectedFlowId;
+                });
+                if (selected) {
+                    renderDetail(selected);
                 }
             }
         };
@@ -740,8 +1217,9 @@
 
     document.getElementById('close-detail').onclick = function() {
         detailPanel.classList.add('hidden');
-        selectedIdx = null;
+        selectedFlowId = null;
         selectedWsConnId = null;
+        selectedAuxKey = null;
         // Restore standard Request/Response tabs
         document.getElementById('frames-tab').classList.add('hidden');
         document.querySelector('[data-tab="response"]').classList.remove('hidden');
@@ -752,8 +1230,12 @@
         requests = [];
         pendingRequests.clear();
         wsFlows.clear();
-        selectedIdx = null;
+        tcpStreams.clear();
+        dnsExchanges.clear();
+        udpExchanges.clear();
+        selectedFlowId = null;
         selectedWsConnId = null;
+        selectedAuxKey = null;
         currentInterceptId = null;
         detailPanel.classList.add('hidden');
         interceptPanel.classList.add('hidden');
@@ -762,9 +1244,12 @@
         document.querySelector('[data-tab="response"]').classList.remove('hidden');
         updateInterceptBtn();
         renderTable();
+        fetch('/api/v1/flows?token=' + encodeURIComponent(apiToken), { method: 'DELETE' }).catch(function(error) {
+            console.warn('Could not clear server-side history:', error);
+        });
     };
 
-    searchInput.oninput = renderTable;
+    searchInput.oninput = scheduleTableUpdate;
 
-    connect();
+    loadSession().finally(connect);
 })();

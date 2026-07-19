@@ -92,6 +92,43 @@ fn render_event(event: &ProxyEvent) -> TerminalOutput {
         ProxyEvent::WebSocketFrame { .. } | ProxyEvent::WebSocketClosed { .. } => {
             TerminalOutput::Ignore
         }
+        ProxyEvent::TcpConnected { id, target, .. } => TerminalOutput::Stdout(format!(
+            "[{}] #{id} TCP⇄ {target}",
+            chrono::Local::now().format("%H:%M:%S")
+        )),
+        ProxyEvent::TcpData { .. } => TerminalOutput::Ignore,
+        ProxyEvent::TcpClosed { stream_id } => TerminalOutput::Stdout(format!(
+            "[{}] #{stream_id} TCP closed",
+            chrono::Local::now().format("%H:%M:%S")
+        )),
+        ProxyEvent::DnsQuery {
+            id,
+            name,
+            query_type,
+            ..
+        } => TerminalOutput::Stdout(format!(
+            "[{}] #{id} DNS {name} type={query_type}",
+            chrono::Local::now().format("%H:%M:%S")
+        )),
+        ProxyEvent::DnsResponse {
+            id,
+            answers,
+            overridden,
+        } => TerminalOutput::Stdout(format!(
+            "[{}] #{id} DNS {}{}",
+            chrono::Local::now().format("%H:%M:%S"),
+            answers.join(", "),
+            if *overridden { " [override]" } else { "" }
+        )),
+        ProxyEvent::UdpExchange { exchange } => TerminalOutput::Stdout(format!(
+            "[{}] #{} UDP {} -> {} ({} / {})",
+            chrono::Local::now().format("%H:%M:%S"),
+            exchange.id,
+            exchange.client,
+            exchange.target,
+            format_size(exchange.request.len()),
+            format_size(exchange.response.len())
+        )),
     }
 }
 
@@ -176,6 +213,28 @@ mod tests {
             render_event(&ProxyEvent::WebSocketClosed { conn_id: 8 }),
             TerminalOutput::Ignore
         ));
+
+        match render_event(&ProxyEvent::UdpExchange {
+            exchange: Box::new(proxyapi_models::CapturedUdpExchange {
+                id: 10,
+                target: "127.0.0.1:9000".to_owned(),
+                client: "127.0.0.1:50000".to_owned(),
+                time: 3,
+                request: Bytes::from_static(b"ping"),
+                response: Bytes::new(),
+                response_received: true,
+                request_truncated: false,
+                response_truncated: false,
+            }),
+        }) {
+            TerminalOutput::Stdout(line) => {
+                assert!(line.contains("#10 UDP"));
+                assert!(line.contains("4B / 0B"));
+            }
+            TerminalOutput::Stderr(_) | TerminalOutput::Ignore => {
+                panic!("expected UDP exchange on stdout")
+            }
+        }
     }
 
     #[tokio::test]

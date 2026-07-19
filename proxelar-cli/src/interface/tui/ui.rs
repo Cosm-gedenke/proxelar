@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 
 use chrono::{Local, TimeZone};
 use http::{HeaderMap, Uri};
-use proxyapi_models::{WsDirection, WsFrame, WsOpcode};
+use proxyapi_models::{
+    CapturedDnsExchange, CapturedTcpStream, CapturedUdpExchange, StreamDirection, WsDirection,
+    WsFrame, WsOpcode,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -44,7 +47,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     };
 
     let title = format!(
-        " Proxelar v{} \u{2500} {req_count} reqs ",
+        " Proxelar v{} \u{2500} {req_count} flows ",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -164,6 +167,77 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                         .style(Style::default().fg(content_type_color(&content_type))),
                     Cell::from(frame_str).style(Style::default().fg(Color::LightCyan)),
                     Cell::from(duration).style(Style::default().fg(duration_color(dur_ms))),
+                ])
+            }
+            FlowEntry::Tcp { stream } => {
+                let size = stream
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.payload.len())
+                    .sum::<usize>();
+                let status = if stream.closed { "closed" } else { "live" };
+                Row::new(vec![
+                    Cell::from(format_time(stream.opened_at)),
+                    Cell::from("TCP").style(Style::default().fg(proto_color("TCP"))),
+                    Cell::from("STREAM").style(Style::default().fg(Color::LightMagenta)),
+                    Cell::from(stream.target.as_str()),
+                    Cell::from("-"),
+                    Cell::from(status).style(Style::default().fg(if stream.closed {
+                        Color::DarkGray
+                    } else {
+                        Color::LightGreen
+                    })),
+                    Cell::from("binary").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(format_size(size)).style(Style::default().fg(size_color(size))),
+                    Cell::from(format!("{}ch", stream.chunks.len())),
+                ])
+            }
+            FlowEntry::Dns { exchange } => {
+                let status = if !exchange.completed {
+                    "pending"
+                } else if exchange.overridden {
+                    "override"
+                } else {
+                    "upstream"
+                };
+                Row::new(vec![
+                    Cell::from(format_time(exchange.time)),
+                    Cell::from("DNS").style(Style::default().fg(proto_color("DNS"))),
+                    Cell::from(dns_query_type(exchange.query_type))
+                        .style(Style::default().fg(Color::LightBlue)),
+                    Cell::from(exchange.name.as_str()),
+                    Cell::from("-"),
+                    Cell::from(status).style(Style::default().fg(if exchange.overridden {
+                        Color::Yellow
+                    } else {
+                        Color::LightGreen
+                    })),
+                    Cell::from("dns"),
+                    Cell::from(format!("{}ans", exchange.answers.len())),
+                    Cell::from("-"),
+                ])
+            }
+            FlowEntry::Udp { exchange } => {
+                let size = exchange.request.len() + exchange.response.len();
+                let status = if exchange.response_received {
+                    "complete"
+                } else {
+                    "no-resp"
+                };
+                Row::new(vec![
+                    Cell::from(format_time(exchange.time)),
+                    Cell::from("UDP").style(Style::default().fg(proto_color("UDP"))),
+                    Cell::from("DGRAM").style(Style::default().fg(Color::LightMagenta)),
+                    Cell::from(exchange.target.as_str()),
+                    Cell::from(exchange.client.as_str()),
+                    Cell::from(status).style(Style::default().fg(if exchange.response_received {
+                        Color::LightGreen
+                    } else {
+                        Color::Yellow
+                    })),
+                    Cell::from("binary").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(format_size(size)).style(Style::default().fg(size_color(size))),
+                    Cell::from("-"),
                 ])
             }
         })
@@ -352,6 +426,42 @@ fn draw_detail(f: &mut Frame, state: &AppState, area: Rect, filtered: &[(usize, 
                     .wrap(Wrap { trim: false });
                 f.render_widget(detail, area);
             }
+            FlowEntry::Tcp { stream } => {
+                let detail = Paragraph::new(build_tcp_lines(stream))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Raw TCP stream ")
+                            .border_style(border_style),
+                    )
+                    .scroll((state.detail_scroll as u16, 0))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, area);
+            }
+            FlowEntry::Dns { exchange } => {
+                let detail = Paragraph::new(build_dns_lines(exchange))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" DNS exchange ")
+                            .border_style(border_style),
+                    )
+                    .scroll((state.detail_scroll as u16, 0))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, area);
+            }
+            FlowEntry::Udp { exchange } => {
+                let detail = Paragraph::new(build_udp_lines(exchange))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" UDP exchange ")
+                            .border_style(border_style),
+                    )
+                    .scroll((state.detail_scroll as u16, 0))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(detail, area);
+            }
         }
     }
 }
@@ -418,7 +528,7 @@ fn draw_editor(f: &mut Frame, session: &mut EditSession, area: Rect) {
         )
     } else if session.typing {
         let t = if session.binary_body {
-            " \u{270e} Editing Request (\u{26a0} binary body) — Esc when done "
+            " \u{270e} Editing Request (structured binary/hex body) — Esc when done "
         } else {
             " \u{270e} Editing Request — Esc when done "
         };
@@ -508,9 +618,18 @@ fn build_request_lines(request: &proxyapi_models::ProxiedRequest) -> Vec<Line<'s
 
     if !request.body().is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            String::from_utf8_lossy(request.body()).into_owned(),
-        ));
+        let metadata = request.body_metadata();
+        if metadata.truncated {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "[truncated: captured {} of {} wire bytes]",
+                    request.body().len(),
+                    metadata.total_seen
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(render_body(request.headers(), request.body())));
     }
 
     lines
@@ -541,12 +660,31 @@ fn build_response_lines(response: &proxyapi_models::ProxiedResponse) -> Vec<Line
 
     if !response.body().is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(
-            String::from_utf8_lossy(response.body()).into_owned(),
-        ));
+        let metadata = response.body_metadata();
+        if metadata.truncated {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "[truncated: captured {} of {} wire bytes]",
+                    response.body().len(),
+                    metadata.total_seen
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        lines.push(Line::from(render_body(response.headers(), response.body())));
     }
 
     lines
+}
+
+fn render_body(headers: &http::HeaderMap, body: &[u8]) -> String {
+    match proxyapi::content::content_view(headers, body) {
+        Ok(view) => view.text,
+        Err(error) => format!(
+            "[content decoding failed: {error}]\n{}",
+            String::from_utf8_lossy(body)
+        ),
+    }
 }
 
 fn build_frames_lines(
@@ -619,6 +757,156 @@ fn build_frames_lines(
     lines
 }
 
+fn build_tcp_lines(stream: &CapturedTcpStream) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Target: ", Style::default().fg(Color::Cyan)),
+            Span::raw(stream.target.clone()),
+        ]),
+        Line::from(format!(
+            "State: {} · {} chunks",
+            if stream.closed { "closed" } else { "live" },
+            stream.chunks.len()
+        )),
+        Line::from(""),
+    ];
+    for chunk in &stream.chunks {
+        let (symbol, color) = match chunk.direction {
+            StreamDirection::ClientToServer => ("↑", Color::Yellow),
+            StreamDirection::ServerToClient => ("↓", Color::Cyan),
+        };
+        let text_preview = std::str::from_utf8(&chunk.payload)
+            .ok()
+            .filter(|value| !value.chars().any(char::is_control))
+            .map(|value| value.chars().take(160).collect::<String>());
+        let preview = text_preview.unwrap_or_else(|| {
+            chunk
+                .payload
+                .iter()
+                .take(48)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        lines.push(Line::from(vec![
+            Span::styled(symbol, Style::default().fg(color)),
+            Span::raw(format!(
+                " {} {}B{} ",
+                format_time(chunk.time),
+                chunk.payload.len(),
+                if chunk.truncated {
+                    " [capture limit]"
+                } else {
+                    ""
+                }
+            )),
+            Span::raw(preview),
+        ]));
+    }
+    lines
+}
+
+fn build_dns_lines(exchange: &CapturedDnsExchange) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                dns_query_type(exchange.query_type),
+                Style::default()
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(exchange.name.clone()),
+        ]),
+        Line::from(format!(
+            "Source: {} · State: {}",
+            if exchange.overridden {
+                "local override"
+            } else {
+                "upstream resolver"
+            },
+            if exchange.completed {
+                "complete"
+            } else {
+                "pending"
+            }
+        )),
+        Line::from(""),
+    ];
+    if exchange.answers.is_empty() {
+        lines.push(Line::from("No IP answers"));
+    } else {
+        lines.extend(
+            exchange
+                .answers
+                .iter()
+                .map(|answer| Line::from(format!("• {answer}"))),
+        );
+    }
+    lines
+}
+
+fn build_udp_lines(exchange: &CapturedUdpExchange) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Client: ", Style::default().fg(Color::Cyan)),
+            Span::raw(exchange.client.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Target: ", Style::default().fg(Color::Cyan)),
+            Span::raw(exchange.target.clone()),
+        ]),
+        Line::from(format!(
+            "Request: {}B{}",
+            exchange.request.len(),
+            if exchange.request_truncated {
+                " [capture limit]"
+            } else {
+                ""
+            }
+        )),
+        Line::from(hex_preview(&exchange.request)),
+        Line::from(""),
+        Line::from(format!(
+            "Response: {}B{}",
+            exchange.response.len(),
+            if exchange.response_truncated {
+                " [capture limit]"
+            } else {
+                ""
+            }
+        )),
+        Line::from(hex_preview(&exchange.response)),
+    ]
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "[no payload]".to_owned();
+    }
+    bytes
+        .iter()
+        .take(512)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn dns_query_type(query_type: u16) -> &'static str {
+    match query_type {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        65 => "HTTPS",
+        _ => "OTHER",
+    }
+}
+
 fn format_time(millis: i64) -> String {
     Local
         .timestamp_millis_opt(millis)
@@ -668,6 +956,9 @@ fn proto_color(proto: &str) -> Color {
         "WSS" => Color::LightCyan,
         "HTTP" => Color::Yellow,
         "WS" => Color::LightMagenta,
+        "TCP" => Color::LightBlue,
+        "UDP" => Color::LightCyan,
+        "DNS" => Color::LightMagenta,
         _ => Color::White,
     }
 }
@@ -1094,7 +1385,7 @@ mod tests {
         state.detail_tab = DetailTab::Response;
         let rendered = render(&mut state);
         assert!(rendered.contains("application/json"));
-        assert!(rendered.contains("{\"items\":[]}"));
+        assert!(rendered.contains("\"items\": []"));
 
         state.table_state.select(Some(1));
         state.detail_tab = DetailTab::Response;

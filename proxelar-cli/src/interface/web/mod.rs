@@ -1,24 +1,24 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path, Query, State,
     },
     response::{Html, IntoResponse},
-    routing::get,
-    Router,
+    routing::{get, post, put},
+    Json, Router,
 };
 use bytes::Bytes;
 use http::{
     header::{HOST, ORIGIN},
     HeaderMap, Uri,
 };
-use proxyapi::{InterceptConfig, InterceptDecision, ProxyEvent};
-use proxyapi_models::ProxiedRequest;
+use proxyapi::{FlowFilter, InterceptConfig, InterceptDecision, ProxyEvent, SessionRecorder};
+use proxyapi_models::{CapturedFlow, ProxiedRequest, TrafficSession};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
@@ -30,6 +30,7 @@ struct WebState {
     token: String,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
+    recorder: Arc<RwLock<SessionRecorder>>,
 }
 
 fn generate_token() -> String {
@@ -50,16 +51,92 @@ enum ClientMessage {
         id: u64,
         method: String,
         uri: String,
-        headers: HashMap<String, String>,
-        body: String,
+        headers: ClientHeaders,
+        body: ClientBody,
     },
     /// Replay a previously captured request.
     Replay {
         method: String,
         uri: String,
-        headers: HashMap<String, String>,
-        body: String,
+        headers: ClientHeaders,
+        body: ClientBody,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClientBody {
+    Text(String),
+    Bytes { bytes: Vec<u8> },
+    Structured { format: String, text: String },
+}
+
+impl Default for ClientBody {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl ClientBody {
+    fn try_into_bytes(self) -> Result<Bytes, String> {
+        match self {
+            Self::Text(body) => Ok(Bytes::from(body)),
+            Self::Bytes { bytes } => Ok(Bytes::from(bytes)),
+            Self::Structured { format, text } => {
+                proxyapi::content::encode_edit(&format, &text).map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClientHeaders {
+    Map(HashMap<String, HeaderValues>),
+    List(Vec<ClientHeader>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderValues {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct ClientHeader {
+    name: String,
+    value: String,
+}
+
+impl ClientHeaders {
+    fn try_into_header_map(self) -> Result<HeaderMap, String> {
+        let values: Vec<(String, String)> = match self {
+            Self::Map(headers) => headers
+                .into_iter()
+                .flat_map(|(name, values)| match values {
+                    HeaderValues::One(value) => vec![(name, value)],
+                    HeaderValues::Many(values) => values
+                        .into_iter()
+                        .map(|value| (name.clone(), value))
+                        .collect(),
+                })
+                .collect(),
+            Self::List(headers) => headers
+                .into_iter()
+                .map(|header| (header.name, header.value))
+                .collect(),
+        };
+        let mut headers = HeaderMap::new();
+        for (name, value) in values {
+            let name = http::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| format!("invalid header name: {error}"))?;
+            let value = http::header::HeaderValue::from_str(&value)
+                .map_err(|error| format!("invalid header value: {error}"))?;
+            headers.append(name, value);
+        }
+        Ok(headers)
+    }
 }
 
 /// Status broadcast to all connected browser clients when intercept state changes.
@@ -69,27 +146,39 @@ struct InterceptStatus {
     pending_count: usize,
 }
 
+pub(crate) struct ServerConfig {
+    pub(crate) addr: std::net::IpAddr,
+    pub(crate) port: u16,
+    pub(crate) token: Option<String>,
+    pub(crate) open_browser: bool,
+    pub(crate) browser_proxy: Option<(std::net::SocketAddr, std::path::PathBuf)>,
+}
+
 pub async fn run(
     mut event_rx: mpsc::Receiver<ProxyEvent>,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
-    gui_addr: std::net::IpAddr,
-    gui_port: u16,
+    recorder: Arc<RwLock<SessionRecorder>>,
+    config: ServerConfig,
     cancel: CancellationToken,
 ) {
-    let token = generate_token();
+    let token = config
+        .token
+        .filter(|token| !token.is_empty())
+        .unwrap_or_else(generate_token);
     let (broadcast_tx, _) = broadcast::channel::<String>(256);
     let state = Arc::new(WebState {
         broadcast_tx: broadcast_tx.clone(),
-        token,
+        token: token.clone(),
         intercept,
         replay_tx,
+        recorder,
     });
 
     // Background task: forward proxy events to broadcast channel
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            match serde_json::to_string(&event) {
+            match serialize_browser_event(&event) {
                 Ok(json) => {
                     if let Err(e) = broadcast_tx.send(json) {
                         tracing::debug!("No active WebSocket subscribers: {e}");
@@ -107,9 +196,18 @@ pub async fn run(
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/v1/status", get(api_status))
+        .route("/api/v1/session", get(api_session))
+        .route("/api/v1/flows", get(api_flows).delete(api_clear_flows))
+        .route("/api/v1/filter", get(api_filter_matches))
+        .route("/api/v1/flows/{id}", get(api_flow))
+        .route("/api/v1/flows/{id}/content/{side}", get(api_content))
+        .route("/api/v1/flows/{id}/replay", post(api_replay))
+        .route("/api/v1/intercept", put(api_set_intercept))
+        .route("/api/v1/intercept/{id}", post(api_resolve_intercept))
         .with_state(state);
 
-    let addr = format!("{gui_addr}:{gui_port}");
+    let addr = format!("{}:{}", config.addr, config.port);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -121,9 +219,16 @@ pub async fn run(
 
     // Open browser *after* successful bind
     let url = format!("http://{addr}");
-    tracing::info!("Web GUI available at {url}");
-    if let Err(e) = open::that(&url) {
-        tracing::warn!("Failed to open browser: {e}");
+    tracing::info!("Web/API server available at {url}");
+    tracing::info!("REST API bearer token: {token}");
+    if let Some((proxy, profile)) = config.browser_proxy {
+        if let Err(error) = crate::browser::launch(&url, proxy, &profile) {
+            tracing::warn!("Failed to launch proxy-configured browser: {error}");
+        }
+    } else if config.open_browser {
+        if let Err(e) = open::that(&url) {
+            tracing::warn!("Failed to open browser: {e}");
+        }
     }
 
     if let Err(e) = axum::serve(listener, app)
@@ -131,6 +236,421 @@ pub async fn run(
         .await
     {
         tracing::error!("Web GUI server error: {e}");
+    }
+}
+
+fn serialize_browser_event(event: &ProxyEvent) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(event)?;
+    if let ProxyEvent::RequestIntercepted { request, .. } = event {
+        let editor = proxyapi::content::editable_content(request.headers(), request.body())
+            .ok()
+            .flatten();
+        let intercepted = value
+            .get_mut("RequestIntercepted")
+            .and_then(serde_json::Value::as_object_mut);
+        if let (Some(editor), Some(intercepted)) = (editor, intercepted) {
+            intercepted.insert(
+                "editor".to_owned(),
+                serde_json::json!({
+                    "format": editor.format.as_str(),
+                    "text": editor.text,
+                }),
+            );
+        }
+    }
+    serde_json::to_string(&value)
+}
+
+fn api_authorized(headers: &HeaderMap, params: &HashMap<String, String>, expected: &str) -> bool {
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
+        .map(|(_, token)| token);
+    bearer.is_some_and(|value| value == expected) || token_matches(params, expected)
+}
+
+fn forbidden() -> axum::response::Response {
+    (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response()
+}
+
+#[derive(Serialize)]
+struct ApiStatus {
+    version: &'static str,
+    intercept_enabled: bool,
+    pending_count: usize,
+    flow_count: usize,
+    websocket_count: usize,
+    tcp_stream_count: usize,
+    dns_exchange_count: usize,
+    udp_exchange_count: usize,
+}
+
+async fn api_status(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let session = state.recorder.read().await;
+    Json(ApiStatus {
+        version: env!("CARGO_PKG_VERSION"),
+        intercept_enabled: state.intercept.is_enabled(),
+        pending_count: state.intercept.pending_count(),
+        flow_count: session.session().flows.len(),
+        websocket_count: session.session().websockets.len(),
+        tcp_stream_count: session.session().tcp_streams.len(),
+        dns_exchange_count: session.session().dns_exchanges.len(),
+        udp_exchange_count: session.session().udp_exchanges.len(),
+    })
+    .into_response()
+}
+
+async fn api_session(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    Json::<TrafficSession>(state.recorder.read().await.snapshot()).into_response()
+}
+
+async fn api_flows(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let filter = match params.get("filter") {
+        Some(expression) => match FlowFilter::parse(expression) {
+            Ok(filter) => Some(filter),
+            Err(error) => {
+                return (axum::http::StatusCode::BAD_REQUEST, error.to_string()).into_response()
+            }
+        },
+        None => None,
+    };
+    let flows = state
+        .recorder
+        .read()
+        .await
+        .session()
+        .flows
+        .iter()
+        .filter(|flow| {
+            filter
+                .as_ref()
+                .is_none_or(|filter| filter.matches(&flow.request, Some(&flow.response), false))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Json::<Vec<CapturedFlow>>(flows).into_response()
+}
+
+#[derive(Serialize)]
+struct ApiFilterMatches {
+    flow_ids: Vec<u64>,
+    websocket_ids: Vec<u64>,
+    tcp_stream_ids: Vec<u64>,
+    dns_exchange_ids: Vec<u64>,
+    udp_exchange_ids: Vec<u64>,
+}
+
+async fn api_filter_matches(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let expression = params.get("filter").map_or("", String::as_str);
+    let filter = match FlowFilter::parse(expression) {
+        Ok(filter) => filter,
+        Err(error) => {
+            return (axum::http::StatusCode::BAD_REQUEST, error.to_string()).into_response()
+        }
+    };
+    let recorder = state.recorder.read().await;
+    let session = recorder.session();
+    Json(ApiFilterMatches {
+        flow_ids: session
+            .flows
+            .iter()
+            .filter(|flow| filter.matches(&flow.request, Some(&flow.response), false))
+            .map(|flow| flow.id)
+            .collect(),
+        websocket_ids: session
+            .websockets
+            .iter()
+            .filter(|flow| {
+                filter.matches_websocket(&flow.request, &flow.response, &flow.frames, flow.closed)
+            })
+            .map(|flow| flow.id)
+            .collect(),
+        tcp_stream_ids: session
+            .tcp_streams
+            .iter()
+            .filter(|stream| filter.matches_tcp(stream))
+            .map(|stream| stream.id)
+            .collect(),
+        dns_exchange_ids: session
+            .dns_exchanges
+            .iter()
+            .filter(|exchange| filter.matches_dns(exchange))
+            .map(|exchange| exchange.id)
+            .collect(),
+        udp_exchange_ids: session
+            .udp_exchanges
+            .iter()
+            .filter(|exchange| filter.matches_udp(exchange))
+            .map(|exchange| exchange.id)
+            .collect(),
+    })
+    .into_response()
+}
+
+async fn api_flow(
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let session = state.recorder.read().await;
+    match session.session().flows.iter().find(|flow| flow.id == id) {
+        Some(flow) => Json(flow.clone()).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "Flow not found").into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct ApiContentView {
+    kind: &'static str,
+    text: String,
+    decoded_len: usize,
+    content_encoding: Option<String>,
+    image_media_type: Option<String>,
+    image_base64: Option<String>,
+    truncated: bool,
+    total_seen: usize,
+}
+
+async fn api_content(
+    Path((id, side)): Path<(u64, String)>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let session = state.recorder.read().await;
+    let Some(flow) = session.session().flows.iter().find(|flow| flow.id == id) else {
+        return (axum::http::StatusCode::NOT_FOUND, "Flow not found").into_response();
+    };
+    let (headers, body, metadata) = match side.as_str() {
+        "request" => (
+            flow.request.headers(),
+            flow.request.body(),
+            flow.request.body_metadata(),
+        ),
+        "response" => (
+            flow.response.headers(),
+            flow.response.body(),
+            flow.response.body_metadata(),
+        ),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "side must be request or response",
+            )
+                .into_response()
+        }
+    };
+    match proxyapi::content::content_view(headers, body) {
+        Ok(view) => {
+            let image_media_type = view
+                .inline_image
+                .as_ref()
+                .map(|image| image.media_type.clone());
+            let image_base64 = view.inline_image.map(|image| image.base64);
+            Json(ApiContentView {
+                kind: view.kind.label(),
+                text: view.text,
+                decoded_len: view.decoded_len,
+                content_encoding: view.content_encoding,
+                image_media_type,
+                image_base64,
+                truncated: metadata.truncated,
+                total_seen: metadata.total_seen,
+            })
+            .into_response()
+        }
+        Err(error) => (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            error.to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_clear_flows(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    state.recorder.write().await.clear();
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+async fn api_replay(
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let request = state
+        .recorder
+        .read()
+        .await
+        .session()
+        .flows
+        .iter()
+        .find(|flow| flow.id == id)
+        .map(|flow| flow.request.clone());
+    let Some(request) = request else {
+        return (axum::http::StatusCode::NOT_FOUND, "Flow not found").into_response();
+    };
+    match state.replay_tx.try_send(request) {
+        Ok(()) => axum::http::StatusCode::ACCEPTED.into_response(),
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Replay queue full",
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetInterceptBody {
+    enabled: bool,
+}
+
+async fn api_set_intercept(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SetInterceptBody>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    state.intercept.set_enabled(body.enabled);
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ApiInterceptDecision {
+    Forward,
+    Drop {
+        #[serde(default = "default_drop_status")]
+        status: u16,
+        #[serde(default)]
+        body: String,
+    },
+    Modify {
+        method: String,
+        uri: String,
+        headers: ClientHeaders,
+        #[serde(default)]
+        body: ClientBody,
+    },
+}
+
+const fn default_drop_status() -> u16 {
+    504
+}
+
+async fn api_resolve_intercept(
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<ApiInterceptDecision>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &params, &state.token) {
+        return forbidden();
+    }
+    let decision = match body {
+        ApiInterceptDecision::Forward => InterceptDecision::Forward,
+        ApiInterceptDecision::Drop { status, body } => {
+            if http::StatusCode::from_u16(status).is_err() {
+                return (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid HTTP status",
+                )
+                    .into_response();
+            }
+            InterceptDecision::Block {
+                status,
+                body: Bytes::from(body),
+            }
+        }
+        ApiInterceptDecision::Modify {
+            method,
+            uri,
+            headers,
+            body,
+        } => {
+            if method.parse::<http::Method>().is_err() || uri.parse::<Uri>().is_err() {
+                return (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid method or URI",
+                )
+                    .into_response();
+            }
+            let Ok(headers) = headers.try_into_header_map() else {
+                return (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "Invalid headers",
+                )
+                    .into_response();
+            };
+            let body = match body.try_into_bytes() {
+                Ok(body) => body,
+                Err(error) => {
+                    return (axum::http::StatusCode::UNPROCESSABLE_ENTITY, error).into_response()
+                }
+            };
+            InterceptDecision::Modified {
+                method,
+                uri,
+                headers,
+                body,
+            }
+        }
+    };
+    if state.intercept.resolve(id, decision) {
+        axum::http::StatusCode::NO_CONTENT.into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, "Pending flow not found").into_response()
     }
 }
 
@@ -143,7 +663,8 @@ async fn css_handler() -> impl IntoResponse {
 }
 
 async fn js_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let js = APP_JS.replace("__WS_TOKEN__", &state.token);
+    let encoded_token = serde_json::to_string(&state.token).expect("a string is always valid JSON");
+    let js = APP_JS.replace("__WS_TOKEN_JSON__", &encoded_token);
     (
         [(axum::http::header::CONTENT_TYPE, "application/javascript")],
         js,
@@ -269,22 +790,37 @@ async fn handle_client_message(text: &str, state: &WebState) {
             headers,
             body,
         } => {
-            let mut header_map = HeaderMap::new();
-            for (k, v) in &headers {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    header_map.append(name, value);
+            let Ok(method) = method.parse::<http::Method>() else {
+                tracing::warn!("Invalid method in browser intercept edit");
+                return;
+            };
+            let Ok(uri) = uri.parse::<Uri>() else {
+                tracing::warn!("Invalid URI in browser intercept edit");
+                return;
+            };
+            let Ok(header_map) = headers.try_into_header_map() else {
+                tracing::warn!("Invalid header in browser intercept edit");
+                return;
+            };
+            let body = match body.try_into_bytes() {
+                Ok(body) => body,
+                Err(error) => {
+                    let message = serde_json::json!({
+                        "EditorError": { "id": id, "message": error }
+                    });
+                    if let Ok(message) = serde_json::to_string(&message) {
+                        let _ = state.broadcast_tx.send(message);
+                    }
+                    return;
                 }
-            }
+            };
             state.intercept.resolve(
                 id,
                 InterceptDecision::Modified {
-                    method,
-                    uri,
+                    method: method.to_string(),
+                    uri: uri.to_string(),
                     headers: header_map,
-                    body: Bytes::from(body.into_bytes()),
+                    body,
                 },
             );
         }
@@ -294,26 +830,25 @@ async fn handle_client_message(text: &str, state: &WebState) {
             headers,
             body,
         } => {
-            let mut header_map = HeaderMap::new();
-            for (k, v) in &headers {
-                if let (Ok(name), Ok(value)) = (
-                    http::header::HeaderName::from_bytes(k.as_bytes()),
-                    http::header::HeaderValue::from_str(v),
-                ) {
-                    header_map.append(name, value);
-                }
-            }
-            let method = method.parse().unwrap_or(http::Method::GET);
-            let uri = uri.parse().unwrap_or_else(|_| "/".parse().unwrap());
+            let Ok(header_map) = headers.try_into_header_map() else {
+                tracing::warn!("Invalid header in browser replay");
+                return;
+            };
+            let Ok(method) = method.parse() else {
+                tracing::warn!("Invalid method in browser replay");
+                return;
+            };
+            let Ok(uri) = uri.parse() else {
+                tracing::warn!("Invalid URI in browser replay");
+                return;
+            };
             let now = chrono::Local::now().timestamp_millis();
-            let req = ProxiedRequest::new(
-                method,
-                uri,
-                http::Version::HTTP_11,
-                header_map,
-                Bytes::from(body.into_bytes()),
-                now,
-            );
+            let Ok(body) = body.try_into_bytes() else {
+                tracing::warn!("Invalid structured body in browser replay");
+                return;
+            };
+            let req =
+                ProxiedRequest::new(method, uri, http::Version::HTTP_11, header_map, body, now);
             if state.replay_tx.try_send(req).is_err() {
                 tracing::warn!("Replay channel full");
             }
@@ -342,6 +877,7 @@ mod tests {
                 token: "test-token".to_owned(),
                 intercept: InterceptConfig::new(),
                 replay_tx,
+                recorder: Arc::new(RwLock::new(SessionRecorder::default())),
             },
             broadcast_rx,
             replay_rx,
@@ -392,7 +928,7 @@ mod tests {
         );
         let js_text = response_text(js).await;
         assert!(js_text.contains("test-token"));
-        assert!(!js_text.contains("__WS_TOKEN__"));
+        assert!(!js_text.contains("__WS_TOKEN_JSON__"));
     }
 
     #[test]
@@ -443,6 +979,27 @@ mod tests {
         assert!(!token_matches(&HashMap::new(), "test-token"));
     }
 
+    #[test]
+    fn api_accepts_bearer_auth_or_query_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "bearer test-token".parse().unwrap(),
+        );
+        assert!(api_authorized(&headers, &HashMap::new(), "test-token"));
+
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Basic test-token".parse().unwrap(),
+        );
+        assert!(!api_authorized(&headers, &HashMap::new(), "test-token"));
+        assert!(api_authorized(
+            &HeaderMap::new(),
+            &HashMap::from([("token".to_owned(), "test-token".to_owned())]),
+            "test-token"
+        ));
+    }
+
     #[tokio::test]
     async fn set_intercept_message_updates_state_and_broadcasts_status() {
         let (state, mut broadcast_rx, _replay_rx) = test_state();
@@ -482,8 +1039,12 @@ mod tests {
                 "id":33,
                 "method":"PATCH",
                 "uri":"http://api.test/items",
-                "headers":{"x-good":"yes","bad header":"ignored"},
-                "body":"changed"
+                "headers":[
+                    {"name":"x-good","value":"yes"},
+                    {"name":"x-repeat","value":"one"},
+                    {"name":"x-repeat","value":"two"}
+                ],
+                "body":{"bytes":[255,0,1]}
             }"#,
             &state,
         )
@@ -499,11 +1060,64 @@ mod tests {
                 assert_eq!(method, "PATCH");
                 assert_eq!(uri, "http://api.test/items");
                 assert_eq!(headers["x-good"], "yes");
-                assert!(!headers.contains_key("bad header"));
-                assert_eq!(body.as_ref(), b"changed");
+                assert_eq!(headers.get_all("x-repeat").iter().count(), 2);
+                assert_eq!(body.as_ref(), b"\xff\x00\x01");
             }
             _ => panic!("expected modified decision"),
         }
+    }
+
+    #[test]
+    fn intercepted_protobuf_event_includes_structured_editor() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/x-protobuf".parse().unwrap(),
+        );
+        let request = ProxiedRequest::new(
+            Method::POST,
+            "http://api.test/message".parse().unwrap(),
+            Version::HTTP_11,
+            headers,
+            Bytes::from_static(&[0x08, 0x96, 0x01]),
+            0,
+        );
+        let event = ProxyEvent::RequestIntercepted {
+            id: 9,
+            request: Box::new(request),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serialize_browser_event(&event).unwrap()).unwrap();
+        assert_eq!(value["RequestIntercepted"]["editor"]["format"], "protobuf");
+        assert!(value["RequestIntercepted"]["editor"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"field\": 1"));
+    }
+
+    #[tokio::test]
+    async fn structured_protobuf_message_is_validated_and_encoded() {
+        let (state, _broadcast_rx, _replay_rx) = test_state();
+        let mut decision_rx = state.intercept.register(34);
+        handle_client_message(
+            r#"{
+                "type":"Modified",
+                "id":34,
+                "method":"POST",
+                "uri":"http://api.test/message",
+                "headers":{"content-type":"application/x-protobuf"},
+                "body":{
+                    "format":"protobuf",
+                    "text":"[{\"field\":1,\"wire\":\"varint\",\"value\":\"151\"}]"
+                }
+            }"#,
+            &state,
+        )
+        .await;
+        let InterceptDecision::Modified { body, .. } = decision_rx.try_recv().unwrap() else {
+            panic!("expected modified decision");
+        };
+        assert_eq!(body.as_ref(), &[0x08, 0x97, 0x01]);
     }
 
     #[tokio::test]
@@ -531,19 +1145,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_json_is_ignored_and_replay_falls_back_for_bad_uri() {
+    async fn malformed_json_and_invalid_replay_are_ignored() {
         let (state, _broadcast_rx, mut replay_rx) = test_state();
 
         handle_client_message("not json", &state).await;
         handle_client_message(
-            r#"{"type":"Replay","method":"bad","uri":"%%%","headers":{},"body":""}"#,
+            r#"{"type":"Replay","method":"bad method","uri":"%%%","headers":{},"body":""}"#,
             &state,
         )
         .await;
 
-        let req = replay_rx.recv().await.unwrap();
-        assert_eq!(req.method().as_str(), "bad");
-        assert_eq!(req.uri().path(), "/");
+        assert!(replay_rx.try_recv().is_err());
     }
 
     #[test]
@@ -598,5 +1210,25 @@ mod tests {
         assert_eq!(complete_event["request"]["time"], 1);
         assert_eq!(complete_event["response"]["status"], 200);
         assert_eq!(complete_event["response"]["time"], 2);
+
+        let udp = ProxyEvent::UdpExchange {
+            exchange: Box::new(proxyapi_models::CapturedUdpExchange {
+                id: 7,
+                target: "127.0.0.1:9000".to_owned(),
+                client: "127.0.0.1:50000".to_owned(),
+                time: 3,
+                request: Bytes::from_static(b"ping"),
+                response: Bytes::new(),
+                response_received: true,
+                request_truncated: false,
+                response_truncated: false,
+            }),
+        };
+        let json = serde_json::to_value(&udp).unwrap();
+        assert_eq!(
+            json["UdpExchange"]["exchange"]["request"],
+            serde_json::json!([112, 105, 110, 103])
+        );
+        assert_eq!(json["UdpExchange"]["exchange"]["response_received"], true);
     }
 }
