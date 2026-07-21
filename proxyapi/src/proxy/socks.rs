@@ -296,4 +296,19 @@ mod tests {
             std::io::ErrorKind::PermissionDenied
         );
     }
+
+    #[test]
+    fn maps_connection_errors_to_socks_reply_statuses() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::PermissionDenied, 2),
+            (std::io::ErrorKind::NetworkUnreachable, 3),
+            (std::io::ErrorKind::HostUnreachable, 4),
+            (std::io::ErrorKind::TimedOut, 4),
+            (std::io::ErrorKind::ConnectionRefused, 5),
+            (std::io::ErrorKind::Other, 1),
+        ] {
+            let error = std::io::Error::from(kind);
+            assert_eq!(reply_status(&error), expected);
+        }
+    }
 }
