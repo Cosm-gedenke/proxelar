@@ -808,7 +808,7 @@ fn could_be_known_protocol(buffered: &[u8]) -> bool {
 
 fn could_be_http1_request(buffered: &[u8]) -> bool {
     let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
-        return !buffered.is_empty() && buffered.iter().all(|byte| is_http_token(*byte));
+        return false;
     };
     if method_end == 0
         || !buffered[..method_end]
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn could_be_known_protocol_waits_for_partial_prefixes() {
         assert!(could_be_known_protocol(b"P"));
-        assert!(could_be_known_protocol(b"CUSTOM"));
+        assert!(!could_be_known_protocol(b"CUSTOM"));
         assert!(could_be_known_protocol(b"CUSTOM /path"));
         assert!(could_be_known_protocol(b"PRI * HTTP/2.0\r\n"));
         assert!(could_be_known_protocol(&[TLS_RECORD_HANDSHAKE]));
