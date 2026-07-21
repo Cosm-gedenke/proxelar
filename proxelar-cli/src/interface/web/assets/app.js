@@ -1,5 +1,25 @@
 (function() {
-    const apiToken = __WS_TOKEN_JSON__;
+    const fragment = new URLSearchParams(location.hash.slice(1));
+    let bootstrapToken = fragment.get('token');
+    if (location.hash) {
+        history.replaceState(null, '', location.pathname + location.search);
+    }
+
+    async function authenticateBrowser() {
+        if (!bootstrapToken) return;
+        const token = bootstrapToken;
+        bootstrapToken = null;
+        const response = await fetch('/api/v1/auth', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Authorization': 'Bearer ' + token },
+        });
+        if (!response.ok) throw new Error('Browser authentication failed');
+    }
+
+    function apiFetch(path, options) {
+        return fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}));
+    }
     const tbody = document.getElementById('requests-body');
     const detailPanel = document.getElementById('detail-panel');
     const detailContent = document.getElementById('detail-content');
@@ -93,8 +113,8 @@
 
     async function loadSession() {
         try {
-            const response = await fetch('/api/v1/session?token=' + encodeURIComponent(apiToken));
-            if (!response.ok) return;
+            const response = await apiFetch('/api/v1/session');
+            if (!response.ok) throw new Error('Session request failed with status ' + response.status);
             const session = await response.json();
             requests = (session.flows || []).slice(-MAX_REQUESTS);
             wsFlows.clear();
@@ -121,11 +141,12 @@
             scheduleTableUpdate();
         } catch (error) {
             console.warn('Could not load capture history:', error);
+            throw error;
         }
     }
 
     function connect() {
-        ws = new WebSocket('ws://' + location.host + '/ws?token=' + encodeURIComponent(apiToken));
+        ws = new WebSocket('ws://' + location.host + '/ws');
 
         ws.onopen = function() {
             statusEl.textContent = 'Connected';
@@ -285,8 +306,8 @@
         }
         filterMatches = emptyFilterMatches();
         try {
-            const response = await fetch(
-                '/api/v1/filter?token=' + encodeURIComponent(apiToken) + '&filter=' + encodeURIComponent(expression)
+            const response = await apiFetch(
+                '/api/v1/filter?filter=' + encodeURIComponent(expression)
             );
             if (!response.ok) throw new Error(await response.text());
             const result = await response.json();
@@ -841,7 +862,7 @@
 
         const renderKey = r.id + ':' + side + ':' + Date.now();
         detailContent.dataset.renderKey = renderKey;
-        fetch('/api/v1/flows/' + r.id + '/content/' + side + '?token=' + encodeURIComponent(apiToken))
+        apiFetch('/api/v1/flows/' + r.id + '/content/' + side)
             .then(function(response) {
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 return response.json();
@@ -1244,12 +1265,19 @@
         document.querySelector('[data-tab="response"]').classList.remove('hidden');
         updateInterceptBtn();
         renderTable();
-        fetch('/api/v1/flows?token=' + encodeURIComponent(apiToken), { method: 'DELETE' }).catch(function(error) {
+        apiFetch('/api/v1/flows', { method: 'DELETE' }).catch(function(error) {
             console.warn('Could not clear server-side history:', error);
         });
     };
 
     searchInput.oninput = scheduleTableUpdate;
 
-    loadSession().finally(connect);
+    authenticateBrowser()
+        .then(loadSession)
+        .then(connect)
+        .catch(function(error) {
+            console.warn('Could not authenticate browser session:', error);
+            statusEl.textContent = 'Authentication required';
+            statusEl.className = 'status disconnected';
+        });
 })();

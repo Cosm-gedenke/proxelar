@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http::{
-    header::{HOST, ORIGIN},
+    header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE},
     HeaderMap, Uri,
 };
 use proxyapi::{FlowFilter, InterceptConfig, InterceptDecision, ProxyEvent, SessionRecorder};
@@ -24,10 +24,12 @@ use tokio_util::sync::CancellationToken;
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const STYLE_CSS: &str = include_str!("assets/style.css");
 const APP_JS: &str = include_str!("assets/app.js");
+const BROWSER_COOKIE: &str = "proxelar_session";
 
 struct WebState {
     broadcast_tx: broadcast::Sender<String>,
-    token: String,
+    api_token: String,
+    browser_token: String,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
     recorder: Arc<RwLock<SessionRecorder>>,
@@ -162,14 +164,16 @@ pub async fn run(
     config: ServerConfig,
     cancel: CancellationToken,
 ) {
-    let token = config
+    let api_token = config
         .token
         .filter(|token| !token.is_empty())
         .unwrap_or_else(generate_token);
+    let browser_token = generate_token();
     let (broadcast_tx, _) = broadcast::channel::<String>(256);
     let state = Arc::new(WebState {
         broadcast_tx: broadcast_tx.clone(),
-        token: token.clone(),
+        api_token: api_token.clone(),
+        browser_token: browser_token.clone(),
         intercept,
         replay_tx,
         recorder,
@@ -195,6 +199,7 @@ pub async fn run(
         .route("/", get(index_handler))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
+        .route("/api/v1/auth", post(api_authenticate_browser))
         .route("/ws", get(ws_handler))
         .route("/api/v1/status", get(api_status))
         .route("/api/v1/session", get(api_session))
@@ -219,14 +224,16 @@ pub async fn run(
 
     // Open browser *after* successful bind
     let url = format!("http://{addr}");
+    let browser_url = format!("{url}/#token={browser_token}");
     tracing::info!("Web/API server available at {url}");
-    tracing::info!("REST API bearer token: {token}");
+    tracing::info!("Browser GUI login URL: {browser_url}");
+    tracing::info!("REST API bearer token: {api_token}");
     if let Some((proxy, profile)) = config.browser_proxy {
-        if let Err(error) = crate::browser::launch(&url, proxy, &profile) {
+        if let Err(error) = crate::browser::launch(&browser_url, proxy, &profile) {
             tracing::warn!("Failed to launch proxy-configured browser: {error}");
         }
     } else if config.open_browser {
-        if let Err(e) = open::that(&url) {
+        if let Err(e) = open::that(&browser_url) {
             tracing::warn!("Failed to open browser: {e}");
         }
     }
@@ -261,18 +268,54 @@ fn serialize_browser_event(event: &ProxyEvent) -> Result<String, serde_json::Err
     serde_json::to_string(&value)
 }
 
-fn api_authorized(headers: &HeaderMap, params: &HashMap<String, String>, expected: &str) -> bool {
-    let bearer = headers
-        .get(http::header::AUTHORIZATION)
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split_once(' '))
         .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
-        .map(|(_, token)| token);
-    bearer.is_some_and(|value| value == expected) || token_matches(params, expected)
+        .map(|(_, token)| token)
+}
+
+fn browser_cookie_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .any(|(name, value)| name == BROWSER_COOKIE && value == expected)
+}
+
+fn api_authorized(headers: &HeaderMap, state: &WebState) -> bool {
+    bearer_token(headers).is_some_and(|token| token == state.api_token)
+        || browser_cookie_matches(headers, &state.browser_token)
 }
 
 fn forbidden() -> axum::response::Response {
     (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response()
+}
+
+async fn api_authenticate_browser(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !bearer_token(&headers).is_some_and(|token| token == state.browser_token) {
+        return forbidden();
+    }
+
+    let cookie = format!(
+        "{BROWSER_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+        state.browser_token
+    );
+    let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        cookie
+            .parse()
+            .expect("generated browser tokens are valid cookie values"),
+    );
+    response
 }
 
 #[derive(Serialize)]
@@ -289,10 +332,9 @@ struct ApiStatus {
 
 async fn api_status(
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let session = state.recorder.read().await;
@@ -311,10 +353,9 @@ async fn api_status(
 
 async fn api_session(
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     Json::<TrafficSession>(state.recorder.read().await.snapshot()).into_response()
@@ -325,7 +366,7 @@ async fn api_flows(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let filter = match params.get("filter") {
@@ -368,7 +409,7 @@ async fn api_filter_matches(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let expression = params.get("filter").map_or("", String::as_str);
@@ -420,10 +461,9 @@ async fn api_filter_matches(
 async fn api_flow(
     Path(id): Path<u64>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let session = state.recorder.read().await;
@@ -448,10 +488,9 @@ struct ApiContentView {
 async fn api_content(
     Path((id, side)): Path<(u64, String)>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let session = state.recorder.read().await;
@@ -506,10 +545,9 @@ async fn api_content(
 
 async fn api_clear_flows(
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     state.recorder.write().await.clear();
@@ -519,10 +557,9 @@ async fn api_clear_flows(
 async fn api_replay(
     Path(id): Path<u64>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let request = state
@@ -554,11 +591,10 @@ struct SetInterceptBody {
 
 async fn api_set_intercept(
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
     Json(body): Json<SetInterceptBody>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     state.intercept.set_enabled(body.enabled);
@@ -591,11 +627,10 @@ const fn default_drop_status() -> u16 {
 async fn api_resolve_intercept(
     Path(id): Path<u64>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
     Json(body): Json<ApiInterceptDecision>,
 ) -> axum::response::Response {
-    if !api_authorized(&headers, &params, &state.token) {
+    if !api_authorized(&headers, &state) {
         return forbidden();
     }
     let decision = match body {
@@ -662,12 +697,10 @@ async fn css_handler() -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "text/css")], STYLE_CSS)
 }
 
-async fn js_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let encoded_token = serde_json::to_string(&state.token).expect("a string is always valid JSON");
-    let js = APP_JS.replace("__WS_TOKEN_JSON__", &encoded_token);
+async fn js_handler() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-        js,
+        APP_JS,
     )
 }
 
@@ -691,14 +724,9 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
             .is_none_or(|path_and_query| path_and_query.as_str() == "/")
 }
 
-fn token_matches(params: &HashMap<String, String>, expected: &str) -> bool {
-    params.get("token").is_some_and(|token| token == expected)
-}
-
 async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<WebState>>,
 ) -> axum::response::Response {
     // The GUI and its WebSocket are same-origin. Comparing against Host allows
@@ -707,8 +735,7 @@ async fn ws_handler(
         return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
-    // Validate token
-    if !token_matches(&params, &state.token) {
+    if !browser_cookie_matches(&headers, &state.browser_token) {
         return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
@@ -874,7 +901,8 @@ mod tests {
         (
             WebState {
                 broadcast_tx,
-                token: "test-token".to_owned(),
+                api_token: "api-token".to_owned(),
+                browser_token: "browser-token".to_owned(),
                 intercept: InterceptConfig::new(),
                 replay_tx,
                 recorder: Arc::new(RwLock::new(SessionRecorder::default())),
@@ -910,9 +938,6 @@ mod tests {
 
     #[tokio::test]
     async fn static_asset_handlers_return_expected_content() {
-        let (state, _broadcast_rx, _replay_rx) = test_state();
-        let state = Arc::new(state);
-
         let index = index_handler().await.into_response();
         assert_eq!(index.status(), http::StatusCode::OK);
         assert!(response_text(index).await.contains("<html"));
@@ -921,14 +946,14 @@ mod tests {
         assert_eq!(css.headers()[http::header::CONTENT_TYPE], "text/css");
         assert!(response_text(css).await.contains(":root"));
 
-        let js = js_handler(State(state)).await.into_response();
+        let js = js_handler().await.into_response();
         assert_eq!(
             js.headers()[http::header::CONTENT_TYPE],
             "application/javascript"
         );
         let js_text = response_text(js).await;
-        assert!(js_text.contains("test-token"));
-        assert!(!js_text.contains("__WS_TOKEN_JSON__"));
+        assert!(!js_text.contains("api-token"));
+        assert!(!js_text.contains("browser-token"));
     }
 
     #[test]
@@ -970,34 +995,61 @@ mod tests {
     }
 
     #[test]
-    fn websocket_token_must_match() {
-        let valid = HashMap::from([("token".to_owned(), "test-token".to_owned())]);
-        let invalid = HashMap::from([("token".to_owned(), "wrong-token".to_owned())]);
-
-        assert!(token_matches(&valid, "test-token"));
-        assert!(!token_matches(&invalid, "test-token"));
-        assert!(!token_matches(&HashMap::new(), "test-token"));
+    fn browser_cookie_must_match() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            "other=value; proxelar_session=browser-token"
+                .parse()
+                .unwrap(),
+        );
+        assert!(browser_cookie_matches(&headers, "browser-token"));
+        assert!(!browser_cookie_matches(&headers, "wrong-token"));
+        assert!(!browser_cookie_matches(&HeaderMap::new(), "browser-token"));
     }
 
     #[test]
-    fn api_accepts_bearer_auth_or_query_token() {
+    fn api_accepts_api_bearer_or_browser_cookie() {
+        let (state, _broadcast_rx, _replay_rx) = test_state();
         let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            "bearer test-token".parse().unwrap(),
-        );
-        assert!(api_authorized(&headers, &HashMap::new(), "test-token"));
+        headers.insert(AUTHORIZATION, "bearer api-token".parse().unwrap());
+        assert!(api_authorized(&headers, &state));
 
-        headers.insert(
-            http::header::AUTHORIZATION,
-            "Basic test-token".parse().unwrap(),
+        headers.insert(AUTHORIZATION, "Basic api-token".parse().unwrap());
+        assert!(!api_authorized(&headers, &state));
+
+        headers.remove(AUTHORIZATION);
+        headers.insert(COOKIE, "proxelar_session=browser-token".parse().unwrap());
+        assert!(api_authorized(&headers, &state));
+    }
+
+    #[tokio::test]
+    async fn browser_authentication_sets_http_only_cookie() {
+        let (state, _broadcast_rx, _replay_rx) = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer browser-token".parse().unwrap());
+
+        let response = api_authenticate_browser(headers, State(Arc::new(state))).await;
+
+        assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[SET_COOKIE],
+            "proxelar_session=browser-token; HttpOnly; SameSite=Strict; Path=/"
         );
-        assert!(!api_authorized(&headers, &HashMap::new(), "test-token"));
-        assert!(api_authorized(
-            &HeaderMap::new(),
-            &HashMap::from([("token".to_owned(), "test-token".to_owned())]),
-            "test-token"
-        ));
+    }
+
+    #[tokio::test]
+    async fn browser_authentication_rejects_api_and_invalid_tokens() {
+        for token in ["api-token", "wrong-token"] {
+            let (state, _broadcast_rx, _replay_rx) = test_state();
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+
+            let response = api_authenticate_browser(headers, State(Arc::new(state))).await;
+
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+            assert!(!response.headers().contains_key(SET_COOKIE));
+        }
     }
 
     #[tokio::test]

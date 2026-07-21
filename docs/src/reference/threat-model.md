@@ -14,7 +14,7 @@ Certificate-pinned clients will reject interception. Android 7+ applications tru
 
 ## GUI and API
 
-The GUI/API requires a random runtime token unless `--api-token` is supplied. The token authorizes reading captured credentials, replaying requests, and resolving intercepts. Bind to loopback by default. The server does not provide TLS, users/roles, rate limiting, or multi-tenant isolation; use an authenticated TLS tunnel for intentional remote access.
+The API requires a random runtime bearer token unless `--api-token` is supplied. The GUI uses a separate random bootstrap token in the URL fragment, exchanges it for an `HttpOnly`, `SameSite=Strict` session cookie, and removes the fragment before making network requests. These credentials authorize reading captured credentials, replaying requests, and resolving intercepts. Bind to loopback by default. The server does not provide TLS, users/roles, rate limiting, or multi-tenant isolation; use an authenticated TLS tunnel for intentional remote access.
 
 Do not place API tokens in URLs when logs or browser history are untrusted. Prefer the `Authorization: Bearer` header.
 

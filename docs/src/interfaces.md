@@ -91,7 +91,7 @@ To make the web GUI accessible from other machines:
 proxelar -i gui -b 0.0.0.0
 ```
 
-The current web GUI is designed for local use. Its WebSocket and REST endpoints are token-protected and validate browser origin/host consistency, but there is no TLS or multi-user authorization. Remote browser access should use an authenticated TLS tunnel.
+The current web GUI is designed for local use. Proxelar opens a login URL whose token is carried in the URL fragment, exchanges it for an `HttpOnly`, `SameSite=Strict` browser-session cookie, and immediately removes the fragment from browser history. The token is never embedded in downloadable assets. REST automation uses a separate bearer token. WebSocket connections additionally validate browser origin/host consistency. There is no TLS or multi-user authorization, so remote browser access should use an authenticated TLS tunnel.
 
 ## Headless API
 
