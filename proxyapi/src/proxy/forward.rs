@@ -29,18 +29,8 @@ use super::{
 
 /// HTTP/2 prior-knowledge connection preface.
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-/// HTTP/1 request method prefixes used for CONNECT tunnel protocol sniffing.
-const HTTP1_METHOD_PREFIXES: &[&[u8]] = &[
-    b"CONNECT ",
-    b"DELETE ",
-    b"GET ",
-    b"HEAD ",
-    b"OPTIONS ",
-    b"PATCH ",
-    b"POST ",
-    b"PUT ",
-    b"TRACE ",
-];
+/// Maximum request prefix inspected while deciding whether a stream is HTTP/1.
+const MAX_PROTOCOL_PREFIX: usize = 4096;
 /// TLS record content type: Handshake.
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 /// TLS major version byte (SSLv3 / TLS 1.x).
@@ -742,7 +732,7 @@ pub(super) async fn sniff_stream_protocol<I>(
 where
     I: AsyncRead + Unpin,
 {
-    let mut buffer = [0u8; H2_PREFACE.len()];
+    let mut buffer = [0u8; MAX_PROTOCOL_PREFIX];
     let mut filled = 0;
 
     loop {
@@ -792,17 +782,50 @@ fn is_h2_preface(buffered: &[u8]) -> bool {
 }
 
 fn is_http1_request(buffered: &[u8]) -> bool {
-    HTTP1_METHOD_PREFIXES
+    let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    let Some(version_start) = buffered[method_end + 1..]
         .iter()
-        .any(|method| buffered.starts_with(method))
+        .position(|byte| *byte == b' ')
+        .map(|offset| method_end + 1 + offset + 1)
+    else {
+        return false;
+    };
+    method_end > 0
+        && buffered[..method_end]
+            .iter()
+            .all(|byte| is_http_token(*byte))
+        && version_start + 8 <= buffered.len()
+        && buffered[version_start..].starts_with(b"HTTP/1.")
 }
 
 fn could_be_known_protocol(buffered: &[u8]) -> bool {
     is_partial_tls_handshake(buffered)
         || H2_PREFACE.starts_with(buffered)
-        || HTTP1_METHOD_PREFIXES
+        || could_be_http1_request(buffered)
+}
+
+fn could_be_http1_request(buffered: &[u8]) -> bool {
+    let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
+        return !buffered.is_empty() && buffered.iter().all(|byte| is_http_token(*byte));
+    };
+    if method_end == 0
+        || !buffered[..method_end]
             .iter()
-            .any(|method| method.starts_with(buffered))
+            .all(|byte| is_http_token(*byte))
+    {
+        return false;
+    }
+    buffered[method_end + 1..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .is_none()
+        || is_http1_request(buffered)
+}
+
+fn is_http_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 fn is_partial_tls_handshake(buffered: &[u8]) -> bool {
@@ -1051,6 +1074,10 @@ mod tests {
             StreamProtocol::Http
         );
         assert_eq!(
+            classify_buffered_protocol(b"PROPFIND /collection HTTP/1.1\r\n"),
+            StreamProtocol::Http
+        );
+        assert_eq!(
             classify_buffered_protocol(&[TLS_RECORD_HANDSHAKE, TLS_VERSION_MAJOR, 0x03, 0x00]),
             StreamProtocol::Tls
         );
@@ -1063,9 +1090,11 @@ mod tests {
     #[test]
     fn could_be_known_protocol_waits_for_partial_prefixes() {
         assert!(could_be_known_protocol(b"P"));
+        assert!(could_be_known_protocol(b"CUSTOM"));
+        assert!(could_be_known_protocol(b"CUSTOM /path"));
         assert!(could_be_known_protocol(b"PRI * HTTP/2.0\r\n"));
         assert!(could_be_known_protocol(&[TLS_RECORD_HANDSHAKE]));
-        assert!(!could_be_known_protocol(b"NOPE"));
+        assert!(!could_be_known_protocol(b"\x01NOPE"));
     }
 
     #[tokio::test]
