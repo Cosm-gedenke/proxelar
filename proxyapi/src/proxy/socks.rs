@@ -1,17 +1,21 @@
+use std::future::poll_fn;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use http::uri::{Authority, Scheme};
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tower_service::Service;
 
 use crate::ca::{CertificateAuthority, Ssl};
 use crate::handler::CapturingHandler;
 use crate::rewind::Rewind;
 
-use super::forward::{serve_stream, sniff_stream_protocol, StreamProtocol};
-use super::Client;
+use super::forward::{serve_pinned_stream, sniff_stream_protocol, StreamProtocol};
+use super::outbound::OutboundConnector;
+use super::BoxError;
 
 const SOCKS_VERSION: u8 = 5;
 const AUTH_NONE: u8 = 0;
@@ -26,7 +30,8 @@ pub async fn handle_connection(
     remote_addr: SocketAddr,
     handler: CapturingHandler,
     ca: Arc<Ssl>,
-    client: Arc<Client>,
+    mut outbound: OutboundConnector,
+    upstream_tls: Arc<rustls::ClientConfig>,
     listen_addr: SocketAddr,
 ) {
     let authority = match accept_connect(&mut stream).await {
@@ -36,6 +41,21 @@ pub async fn handle_connection(
             return;
         }
     };
+    let upstream = match connect_target(&authority, &mut outbound).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let status = reply_status(error.as_ref());
+            let _ = send_reply(&mut stream, status, None).await;
+            tracing::debug!("SOCKS5 upstream connection failed: {error}");
+            return;
+        }
+    };
+    let bound = upstream.local_addr().ok();
+    if let Err(error) = send_reply(&mut stream, 0, bound).await {
+        tracing::debug!("SOCKS5 success reply failed: {error}");
+        return;
+    }
+
     let (protocol, buffered) = match sniff_stream_protocol(&mut stream).await {
         Ok(result) => result,
         Err(error) => {
@@ -46,12 +66,12 @@ pub async fn handle_connection(
     let stream = Rewind::new_buffered(stream, buffered);
     match protocol {
         StreamProtocol::Http => {
-            if let Err(error) = serve_stream(
+            if let Err(error) = serve_pinned_stream(
                 stream,
+                upstream,
                 Scheme::HTTP,
                 handler,
                 ca,
-                client,
                 remote_addr,
                 listen_addr,
             )
@@ -61,6 +81,23 @@ pub async fn handle_connection(
             }
         }
         StreamProtocol::Tls => {
+            let server_name = match ServerName::try_from(authority.host().to_owned()) {
+                Ok(server_name) => server_name,
+                Err(error) => {
+                    tracing::warn!("SOCKS5 upstream TLS server name is invalid: {error}");
+                    return;
+                }
+            };
+            let upstream = match TlsConnector::from(upstream_tls)
+                .connect(server_name, upstream)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!("SOCKS5 upstream TLS handshake failed: {error}");
+                    return;
+                }
+            };
             let server_config = match ca.gen_server_config(&authority).await {
                 Ok(config) => config,
                 Err(error) => {
@@ -75,12 +112,12 @@ pub async fn handle_connection(
                     return;
                 }
             };
-            if let Err(error) = serve_stream(
+            if let Err(error) = serve_pinned_stream(
                 stream,
+                upstream,
                 Scheme::HTTPS,
                 handler,
                 ca,
-                client,
                 remote_addr,
                 listen_addr,
             )
@@ -91,13 +128,7 @@ pub async fn handle_connection(
         }
         StreamProtocol::Unknown => {
             let mut client_stream = stream;
-            let mut upstream = match TcpStream::connect(authority.as_str()).await {
-                Ok(upstream) => upstream,
-                Err(error) => {
-                    tracing::debug!("SOCKS5 upstream connection failed: {error}");
-                    return;
-                }
-            };
+            let mut upstream = upstream;
             if let Err(error) = super::raw::tunnel(
                 &mut client_stream,
                 &mut upstream,
@@ -137,7 +168,7 @@ async fn accept_connect(stream: &mut TcpStream) -> Result<Authority, std::io::Er
     let mut request = [0_u8; 4];
     stream.read_exact(&mut request).await?;
     if request[0] != SOCKS_VERSION || request[1] != COMMAND_CONNECT || request[2] != 0 {
-        send_reply(stream, 7).await?;
+        send_reply(stream, 7, None).await?;
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "only SOCKS5 CONNECT is supported",
@@ -162,7 +193,7 @@ async fn accept_connect(stream: &mut TcpStream) -> Result<Authority, std::io::Er
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
         }
         _ => {
-            send_reply(stream, 8).await?;
+            send_reply(stream, 8, None).await?;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unsupported SOCKS address type",
@@ -173,14 +204,54 @@ async fn accept_connect(stream: &mut TcpStream) -> Result<Authority, std::io::Er
     let authority = format!("{host}:{port}")
         .parse::<Authority>()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    send_reply(stream, 0).await?;
     Ok(authority)
 }
 
-async fn send_reply(stream: &mut TcpStream, status: u8) -> Result<(), std::io::Error> {
-    stream
-        .write_all(&[SOCKS_VERSION, status, 0, ADDRESS_IPV4, 0, 0, 0, 0, 0, 0])
-        .await
+async fn connect_target(
+    authority: &Authority,
+    outbound: &mut OutboundConnector,
+) -> Result<TcpStream, BoxError> {
+    let destination = format!("http://{authority}/").parse()?;
+    poll_fn(|context| outbound.poll_ready(context)).await?;
+    Ok(outbound.call(destination).await?.into_inner())
+}
+
+fn reply_status(error: &(dyn std::error::Error + 'static)) -> u8 {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            return match error.kind() {
+                std::io::ErrorKind::PermissionDenied => 2,
+                std::io::ErrorKind::NetworkUnreachable => 3,
+                std::io::ErrorKind::HostUnreachable | std::io::ErrorKind::TimedOut => 4,
+                std::io::ErrorKind::ConnectionRefused => 5,
+                _ => 1,
+            };
+        }
+        current = error.source();
+    }
+    1
+}
+
+async fn send_reply(
+    stream: &mut TcpStream,
+    status: u8,
+    bound: Option<SocketAddr>,
+) -> Result<(), std::io::Error> {
+    let bound = bound.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let mut reply = vec![SOCKS_VERSION, status, 0];
+    match bound.ip() {
+        IpAddr::V4(ip) => {
+            reply.push(ADDRESS_IPV4);
+            reply.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            reply.push(ADDRESS_IPV6);
+            reply.extend_from_slice(&ip.octets());
+        }
+    }
+    reply.extend_from_slice(&bound.port().to_be_bytes());
+    stream.write_all(&reply).await
 }
 
 #[cfg(test)]
@@ -208,9 +279,6 @@ mod tests {
             ])
             .await
             .unwrap();
-        let mut reply = [0_u8; 10];
-        client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0);
         assert_eq!(server.await.unwrap().as_str(), "example.com:80");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

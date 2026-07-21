@@ -9,7 +9,7 @@ use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
@@ -60,6 +60,63 @@ enum TunnelRequestError {
     MissingHost,
     InvalidHost,
     InvalidUri,
+}
+
+#[derive(Clone)]
+enum UpstreamClient {
+    Shared(Arc<Client>),
+    Pinned(Arc<Mutex<hyper::client::conn::http1::SendRequest<ProxyBody>>>),
+}
+
+impl UpstreamClient {
+    async fn pinned<I>(stream: I) -> Result<Self, BoxError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(stream))
+            .await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                tracing::debug!("Pinned upstream HTTP connection closed: {error}");
+            }
+        });
+        Ok(Self::Pinned(Arc::new(Mutex::new(sender))))
+    }
+
+    async fn request(
+        &self,
+        mut request: Request<ProxyBody>,
+    ) -> Result<Response<hyper::body::Incoming>, BoxError> {
+        match self {
+            Self::Shared(client) => client.request(request).await.map_err(Into::into),
+            Self::Pinned(sender) => {
+                use http::header::HOST;
+
+                let authority = request.uri().authority().cloned().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pinned upstream request is missing an authority",
+                    )
+                })?;
+                request
+                    .headers_mut()
+                    .insert(HOST, authority.as_str().parse()?);
+                let path_and_query: http::uri::PathAndQuery = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", http::uri::PathAndQuery::as_str)
+                    .parse()?;
+                *request.uri_mut() = Uri::builder().path_and_query(path_and_query).build()?;
+
+                let mut sender = sender.lock().await;
+                sender.ready().await?;
+                sender.send_request(request).await.map_err(Into::into)
+            }
+        }
+    }
 }
 
 /// Returns true when the request carries WebSocket upgrade tokens.
@@ -438,12 +495,65 @@ pub(super) async fn serve_stream<I>(
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_stream_with_upstream(
+        stream,
+        scheme,
+        handler,
+        ca,
+        UpstreamClient::Shared(client),
+        remote_addr,
+        listen_addr,
+    )
+    .await
+}
+
+/// Serve inspected client traffic over one already-established upstream
+/// connection. SOCKS5 uses this to preserve the destination selected by its
+/// CONNECT request even when the inner HTTP `Host` value differs.
+pub(super) async fn serve_pinned_stream<I, U>(
+    stream: I,
+    upstream: U,
+    scheme: Scheme,
+    handler: CapturingHandler,
+    ca: Arc<Ssl>,
+    remote_addr: SocketAddr,
+    listen_addr: SocketAddr,
+) -> Result<(), BoxError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let upstream = UpstreamClient::pinned(upstream).await?;
+    serve_stream_with_upstream(
+        stream,
+        scheme,
+        handler,
+        ca,
+        upstream,
+        remote_addr,
+        listen_addr,
+    )
+    .await
+}
+
+async fn serve_stream_with_upstream<I>(
+    stream: I,
+    scheme: Scheme,
+    handler: CapturingHandler,
+    ca: Arc<Ssl>,
+    upstream: UpstreamClient,
+    remote_addr: SocketAddr,
+    listen_addr: SocketAddr,
+) -> Result<(), BoxError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = TokioIo::new(stream);
 
     let service = service_fn(move |mut req: Request<hyper::body::Incoming>| {
         let handler = handler.clone();
         let ca = Arc::clone(&ca);
-        let client = Arc::clone(&client);
+        let upstream = upstream.clone();
         let scheme = scheme.clone();
 
         async move {
@@ -458,7 +568,7 @@ where
                 return Ok::<_, hyper::Error>(resp);
             }
 
-            forward_http_request(req, handler, client, remote_addr).await
+            forward_http_request_with(req, handler, upstream, remote_addr).await
         }
     });
 
@@ -466,9 +576,18 @@ where
 }
 
 async fn forward_http_request(
+    req: Request<hyper::body::Incoming>,
+    handler: CapturingHandler,
+    client: Arc<Client>,
+    remote_addr: SocketAddr,
+) -> Result<Response<ProxyBody>, hyper::Error> {
+    forward_http_request_with(req, handler, UpstreamClient::Shared(client), remote_addr).await
+}
+
+async fn forward_http_request_with(
     mut req: Request<hyper::body::Incoming>,
     mut handler: CapturingHandler,
-    client: Arc<Client>,
+    upstream: UpstreamClient,
     remote_addr: SocketAddr,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let client_version = req.version();
@@ -496,7 +615,7 @@ async fn forward_http_request(
         prepare_upstream_request(req)
     };
 
-    match client.request(upstream_req).await {
+    match upstream.request(upstream_req).await {
         Ok(res) => {
             if is_ws && res.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
                 return Ok(upgrade_websocket_response(res, handler, client_on_upgrade));

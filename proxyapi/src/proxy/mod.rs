@@ -280,13 +280,13 @@ impl Proxy {
             );
         }
 
-        let tls_config = tls::build_client_config(&self.config.upstream_tls)?;
+        let tls_config = Arc::new(tls::build_client_config(&self.config.upstream_tls)?);
         let outbound = outbound::OutboundConnector::new(self.upstream_proxy.as_ref())?;
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
+            .with_tls_config((*tls_config).clone())
             .https_or_http()
             .enable_http1()
-            .wrap_connector(outbound);
+            .wrap_connector(outbound.clone());
 
         let client = Arc::new(
             hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(https),
@@ -349,6 +349,8 @@ impl Proxy {
                     }
                     let ca = Arc::clone(&ca);
                     let client = Arc::clone(&client);
+                    let outbound = outbound.clone();
+                    let upstream_tls = Arc::clone(&tls_config);
 
                     match &self.config.mode {
                         ProxyMode::Forward => {
@@ -380,7 +382,8 @@ impl Proxy {
                                 remote_addr,
                                 handler,
                                 ca,
-                                client,
+                                outbound,
+                                upstream_tls,
                                 self.config.addr,
                             ));
                         }
