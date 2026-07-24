@@ -9,6 +9,7 @@
 
 ### Added
 
+- Show the generated WireGuard client profile as an importable QR code in the empty TUI and authenticated web GUI, and at terminal startup.
 - Add versioned native sessions, HAR import/export, curl and raw HTTP export, default secret redaction, and body truncation metadata.
 - Add shared boolean flow filters and decoded, content-aware body views across the TUI, web GUI, and REST API.
 - Add transparent, privilege-free WireGuard, SOCKS5, UDP DNS, and fixed-target raw UDP modes, raw TCP observation, and upstream HTTP CONNECT/SOCKS5 chaining.
@@ -20,6 +21,7 @@
 
 ### Changed
 
+- Use the Android-compatible `proxelar-wg.conf` client-profile name instead of a tunnel name longer than WireGuard's 15-character limit.
 - Restore `proxyapi`'s `#![forbid(unsafe_code)]` guarantee by removing the unsafe native-Lua-module runtime and its separate Windows distribution; Lua addons remain portable and pure Lua.
 - Use distinct ECDSA private keys for generated leaf certificates instead of reusing the root CA key.
 - Reconcile stale transfer/content encoding headers and `Content-Length` after intercepted or replayed body edits.

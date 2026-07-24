@@ -31,7 +31,9 @@ const CLIENT_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const SERVER_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const SERVER_KEY_FILE: &str = "wireguard-server.key";
 const CLIENT_KEY_FILE: &str = "wireguard-client.key";
-const CLIENT_CONFIG_FILE: &str = "wireguard-client.conf";
+// Android derives the tunnel/interface name from this stem and enforces the
+// WireGuard 15-character interface-name limit.
+const CLIENT_CONFIG_FILE: &str = "proxelar-wg.conf";
 
 /// Key material and DNS policy for a single-peer WireGuard capture endpoint.
 ///
@@ -509,6 +511,10 @@ mod tests {
         assert_eq!(first.server_private_key, second.server_private_key);
         assert_eq!(first.peer_public_key, second.peer_public_key);
         assert_eq!(path, second_path);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("proxelar-wg.conf")
+        );
         let contents = std::fs::read_to_string(path).unwrap();
         assert!(contents.contains("Address = 10.0.0.2/32, fd00::2/128"));
         assert!(contents.contains("Endpoint = vpn.example:51820"));

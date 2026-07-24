@@ -100,7 +100,7 @@ proxelar -m dns -p 5353 --dns-map api.example.test=127.0.0.1
 # Fixed-target raw UDP inspection
 proxelar -m udp -p 9001 --target upstream.example:9000
 
-# Mobile/IoT capture; import ~/.proxelar/wireguard-client.conf on the device
+# Mobile/IoT capture; scan the displayed QR or import ~/.proxelar/proxelar-wg.conf
 proxelar -m wireguard -b 0.0.0.0 -p 51820 \
   --wireguard-endpoint 192.168.1.10:51820
 

@@ -1,6 +1,7 @@
 mod browser;
 mod cli;
 mod interface;
+mod wireguard_setup;
 
 use clap::Parser;
 #[cfg(feature = "scripting")]
@@ -75,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.script.clone()
     };
 
+    let mut wireguard_setup = None;
     let proxy_mode = match args.mode {
         Mode::Forward => ProxyMode::Forward,
         Mode::Reverse => {
@@ -124,6 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (config, client_config) =
                 WireGuardConfig::load_or_generate(&ca_dir, &endpoint, dns)?;
+            wireguard_setup = Some(Arc::new(wireguard_setup::WireGuardSetup::from_config(
+                &client_config,
+            )?));
             eprintln!(
                 "WireGuard client configuration: {}",
                 client_config.display()
@@ -212,9 +217,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match args.interface {
-        Interface::Terminal => interface::terminal::run(event_rx, args.quiet, cancel.clone()).await,
+        Interface::Terminal => {
+            interface::terminal::run(event_rx, args.quiet, wireguard_setup, cancel.clone()).await
+        }
         Interface::Tui => {
-            interface::tui::run(event_rx, Arc::clone(&intercept), replay_tx, cancel.clone()).await
+            interface::tui::run(
+                event_rx,
+                Arc::clone(&intercept),
+                replay_tx,
+                wireguard_setup,
+                cancel.clone(),
+            )
+            .await
         }
         Interface::Gui | Interface::Api => {
             let open_browser = matches!(args.interface, Interface::Gui);
@@ -228,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     port: args.gui_port,
                     token: args.api_token,
                     open_browser,
+                    wireguard_setup,
                     browser_proxy: args.launch_browser.then(|| {
                         let browser_addr = if args.addr.is_unspecified() {
                             if args.addr.is_ipv6() {

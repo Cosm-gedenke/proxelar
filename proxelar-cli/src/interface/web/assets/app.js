@@ -21,6 +21,9 @@
         return fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}));
     }
     const tbody = document.getElementById('requests-body');
+    const requestsTable = document.getElementById('requests-table');
+    const wireguardSetup = document.getElementById('wireguard-setup');
+    const wireguardQr = document.getElementById('wireguard-qr');
     const detailPanel = document.getElementById('detail-panel');
     const detailContent = document.getElementById('detail-content');
     const statusEl = document.getElementById('status');
@@ -108,6 +111,32 @@
     let filterMatches = null;
     let filterGeneration = 0;
     let filterTimer = null;
+    let wireguardAvailable = false;
+
+    async function loadWireGuardSetup() {
+        const response = await apiFetch('/api/v1/wireguard.svg');
+        if (response.status === 404) return;
+        if (!response.ok) throw new Error('WireGuard setup request failed with status ' + response.status);
+        const image = await response.blob();
+        wireguardQr.src = URL.createObjectURL(image);
+        wireguardAvailable = true;
+        updateWireGuardSetup();
+    }
+
+    function hasCapturedTraffic() {
+        return requests.length > 0
+            || pendingRequests.size > 0
+            || wsFlows.size > 0
+            || tcpStreams.size > 0
+            || dnsExchanges.size > 0
+            || udpExchanges.size > 0;
+    }
+
+    function updateWireGuardSetup() {
+        const visible = wireguardAvailable && !hasCapturedTraffic();
+        wireguardSetup.classList.toggle('hidden', !visible);
+        requestsTable.classList.toggle('hidden', visible);
+    }
 
     // ─── WebSocket ───────────────────────────────────────────────────────────
 
@@ -660,6 +689,7 @@
     function renderTable() {
         const filtered = getFiltered();
         tbody.innerHTML = '';
+        updateWireGuardSetup();
 
         filtered.forEach(function(r, i) {
             const tr = document.createElement('tr');
@@ -1273,6 +1303,7 @@
     searchInput.oninput = scheduleTableUpdate;
 
     authenticateBrowser()
+        .then(loadWireGuardSetup)
         .then(loadSession)
         .then(connect)
         .catch(function(error) {

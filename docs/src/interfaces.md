@@ -12,6 +12,8 @@ proxelar -i tui
 
 An interactive terminal interface built with [ratatui](https://github.com/ratatui/ratatui). Shows a table of all captured requests and WebSocket connections with nine columns: time, protocol, method, host, path, status, content-type, size, and duration.
 
+In WireGuard mode, an empty capture displays the generated client profile as a QR code. Scan it from the WireGuard mobile app; the table replaces it when the first event arrives.
+
 ### Key bindings
 
 | Key | Action |
@@ -58,6 +60,8 @@ proxelar -i terminal
 
 Prints each request/response as a colored line to stdout. Useful for quick inspection or when piping output to other tools.
 
+In WireGuard mode, terminal output begins with the client-profile QR code and configuration path before printing captured events.
+
 Output includes timestamp, HTTP method (color-coded), URL, status code, and response size.
 
 Pass `--quiet` (`-q`) to suppress the per-request lines; errors still go to stderr. This is useful with a [Lua script](scripting/overview.md) that produces its own output via `print()`:
@@ -83,6 +87,7 @@ Features:
 - Intercept mode — pause requests, edit method/URI/headers/body, then forward or drop
 - Decoded and content-aware request/response views with truncation metadata
 - Lossless text/hex request-body editing and raw TCP/DNS/UDP detail views
+- Authenticated WireGuard client QR shown until the first captured event
 - Light and dark mode (follows system preference)
 
 To make the web GUI accessible from other machines:

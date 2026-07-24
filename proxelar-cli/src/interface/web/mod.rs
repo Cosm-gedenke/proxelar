@@ -9,7 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http::{
-    header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE},
+    header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE},
     HeaderMap, Uri,
 };
 use proxyapi::{FlowFilter, InterceptConfig, InterceptDecision, ProxyEvent, SessionRecorder};
@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
+
+use crate::wireguard_setup::WireGuardSetup;
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const STYLE_CSS: &str = include_str!("assets/style.css");
@@ -33,6 +35,7 @@ struct WebState {
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
     recorder: Arc<RwLock<SessionRecorder>>,
+    wireguard_setup: Option<Arc<WireGuardSetup>>,
 }
 
 fn generate_token() -> String {
@@ -153,6 +156,7 @@ pub(crate) struct ServerConfig {
     pub(crate) port: u16,
     pub(crate) token: Option<String>,
     pub(crate) open_browser: bool,
+    pub(crate) wireguard_setup: Option<Arc<WireGuardSetup>>,
     pub(crate) browser_proxy: Option<(std::net::SocketAddr, std::path::PathBuf)>,
 }
 
@@ -177,6 +181,7 @@ pub async fn run(
         intercept,
         replay_tx,
         recorder,
+        wireguard_setup: config.wireguard_setup,
     });
 
     // Background task: forward proxy events to broadcast channel
@@ -200,6 +205,7 @@ pub async fn run(
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
         .route("/api/v1/auth", post(api_authenticate_browser))
+        .route("/api/v1/wireguard.svg", get(api_wireguard_svg))
         .route("/ws", get(ws_handler))
         .route("/api/v1/status", get(api_status))
         .route("/api/v1/session", get(api_session))
@@ -244,6 +250,30 @@ pub async fn run(
     {
         tracing::error!("Web GUI server error: {e}");
     }
+}
+
+async fn api_wireguard_svg(
+    headers: HeaderMap,
+    State(state): State<Arc<WebState>>,
+) -> axum::response::Response {
+    if !api_authorized(&headers, &state) {
+        return forbidden();
+    }
+    let Some(setup) = &state.wireguard_setup else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = setup.svg().to_owned().into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "image/svg+xml; charset=utf-8"
+            .parse()
+            .expect("static content type is valid"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        "no-store".parse().expect("static cache control is valid"),
+    );
+    response
 }
 
 fn serialize_browser_event(event: &ProxyEvent) -> Result<String, serde_json::Error> {
@@ -906,6 +936,7 @@ mod tests {
                 intercept: InterceptConfig::new(),
                 replay_tx,
                 recorder: Arc::new(RwLock::new(SessionRecorder::default())),
+                wireguard_setup: None,
             },
             broadcast_rx,
             replay_rx,
@@ -1050,6 +1081,36 @@ mod tests {
             assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
             assert!(!response.headers().contains_key(SET_COOKIE));
         }
+    }
+
+    #[tokio::test]
+    async fn wireguard_qr_requires_authentication_and_disables_caching() {
+        let (mut state, _broadcast_rx, _replay_rx) = test_state();
+        state.wireguard_setup = Some(Arc::new(
+            WireGuardSetup::from_bytes(
+                "proxelar-wg".to_owned(),
+                std::path::PathBuf::from("/tmp/proxelar-wg.conf"),
+                b"[Interface]\nPrivateKey = test\n\n[Peer]\nPublicKey = peer\n",
+            )
+            .unwrap(),
+        ));
+        let state = Arc::new(state);
+
+        let forbidden_response =
+            api_wireguard_svg(HeaderMap::new(), State(Arc::clone(&state))).await;
+        assert_eq!(forbidden_response.status(), http::StatusCode::FORBIDDEN);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, "proxelar_session=browser-token".parse().unwrap());
+        let response = api_wireguard_svg(headers, State(state)).await;
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "image/svg+xml; charset=utf-8"
+        );
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert!(response_text(response).await.starts_with("<svg"));
     }
 
     #[tokio::test]

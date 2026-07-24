@@ -1,9 +1,11 @@
 use crossterm::style::{Color, Stylize};
 use proxyapi::ProxyEvent;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::interface::format_size;
+use crate::wireguard_setup::WireGuardSetup;
 
 enum TerminalOutput {
     Stdout(String),
@@ -11,7 +13,38 @@ enum TerminalOutput {
     Ignore,
 }
 
-pub async fn run(mut event_rx: mpsc::Receiver<ProxyEvent>, quiet: bool, cancel: CancellationToken) {
+pub async fn run(
+    mut event_rx: mpsc::Receiver<ProxyEvent>,
+    quiet: bool,
+    wireguard_setup: Option<Arc<WireGuardSetup>>,
+    cancel: CancellationToken,
+) {
+    if let Some(setup) = wireguard_setup {
+        println!(
+            "{}",
+            format!(
+                "Scan to import WireGuard tunnel \"{}\"",
+                setup.profile_name()
+            )
+            .bold()
+        );
+        println!("Config: {}", setup.config_path().display());
+        for line in setup.terminal_lines() {
+            println!(
+                "{}",
+                line.as_str()
+                    .with(Color::Rgb { r: 0, g: 0, b: 0 })
+                    .on(Color::Rgb {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                    })
+            );
+        }
+        println!("Scan with the WireGuard app, enable the tunnel, then generate traffic.");
+        println!();
+    }
+
     if !quiet {
         println!("{}", "Proxelar proxy running. Press Ctrl+C to stop.".bold());
         println!();
@@ -305,8 +338,11 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), run(rx, false, cancel))
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(rx, false, None, cancel),
+        )
+        .await
+        .unwrap();
     }
 }

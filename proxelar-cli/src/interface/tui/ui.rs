@@ -7,7 +7,7 @@ use proxyapi_models::{
     WsFrame, WsOpcode,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
@@ -18,8 +18,9 @@ use super::state::EditSession;
 
 use super::state::{matches_filter, AppState, DetailTab, FlowEntry};
 use crate::interface::format_size;
+use crate::wireguard_setup::WireGuardSetup;
 
-pub fn draw(f: &mut Frame, state: &mut AppState) {
+pub fn draw(f: &mut Frame, state: &mut AppState, wireguard_setup: Option<&WireGuardSetup>) {
     let filter = state.filter.as_deref();
     let filtered: Vec<(usize, &FlowEntry)> = state
         .entries
@@ -265,7 +266,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             .add_modifier(Modifier::BOLD),
     );
 
-    f.render_stateful_widget(table, chunks[0], &mut state.table_state);
+    if state.entries.is_empty() {
+        if let Some(setup) = wireguard_setup {
+            draw_wireguard_setup(f, chunks[0], setup);
+        } else {
+            f.render_stateful_widget(table, chunks[0], &mut state.table_state);
+        }
+    } else {
+        f.render_stateful_widget(table, chunks[0], &mut state.table_state);
+    }
 
     // Detail panel
     if state.detail_open && chunks.len() > 2 {
@@ -288,6 +297,62 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     if state.show_help {
         draw_help_modal(f);
     }
+}
+
+fn draw_wireguard_setup(f: &mut Frame, area: Rect, setup: &WireGuardSetup) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Proxelar v{} ─ WireGuard setup ",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let qr_width = setup
+        .terminal_lines()
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let content_height = setup.terminal_lines().len().saturating_add(4);
+    if qr_width > inner.width as usize || content_height > inner.height as usize {
+        let message = Paragraph::new(vec![
+            Line::from("WireGuard profile is ready."),
+            Line::from("Enlarge the terminal to display its QR code."),
+            Line::from(format!("Config: {}", setup.config_path().display())),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+        f.render_widget(message, inner);
+        return;
+    }
+
+    let centered = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(content_height as u16),
+        Constraint::Fill(1),
+    ])
+    .split(inner)[1];
+    let mut lines = vec![
+        Line::from(format!(
+            "Scan \"{}\" with the WireGuard app",
+            setup.profile_name()
+        )),
+        Line::from(""),
+    ];
+    lines.extend(setup.terminal_lines().iter().map(|line| {
+        Line::styled(
+            line.as_str(),
+            Style::default()
+                .fg(Color::Rgb(0, 0, 0))
+                .bg(Color::Rgb(255, 255, 255)),
+        )
+    }));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "The QR disappears after the first captured flow.",
+    ));
+    let qr = Paragraph::new(lines).alignment(Alignment::Center);
+    f.render_widget(qr, centered);
 }
 
 fn draw_status_bar(f: &mut Frame, state: &AppState, area: Rect, pending_count: usize) {
@@ -1173,9 +1238,15 @@ mod tests {
     }
 
     fn render(state: &mut AppState) -> String {
+        render_with_setup(state, None)
+    }
+
+    fn render_with_setup(state: &mut AppState, wireguard_setup: Option<&WireGuardSetup>) -> String {
         let backend = TestBackend::new(160, 42);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, state)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, state, wireguard_setup))
+            .unwrap();
         buffer_text(terminal.backend().buffer())
     }
 
@@ -1393,6 +1464,43 @@ mod tests {
         assert!(rendered.contains("socket.test"));
         assert!(rendered.contains("client"));
         assert!(rendered.contains("Connection closed"));
+    }
+
+    #[test]
+    fn draw_shows_wireguard_qr_only_while_capture_is_empty() {
+        let setup = WireGuardSetup::from_bytes(
+            "proxelar-wg".to_owned(),
+            std::path::PathBuf::from("/tmp/proxelar-wg.conf"),
+            b"[Interface]\nPrivateKey = test\n\n[Peer]\nPublicKey = peer\nEndpoint = 192.0.2.1:51820\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
+        let mut state = AppState::new();
+
+        let rendered = render_with_setup(&mut state, Some(&setup));
+        assert!(rendered.contains("WireGuard setup"));
+        assert!(rendered.contains("Scan \"proxelar-wg\""));
+
+        let backend = TestBackend::new(160, 42);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut state, Some(&setup)))
+            .unwrap();
+        let dark_module = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "█")
+            .expect("QR code should contain a dark module");
+        assert_eq!(dark_module.fg, Color::Rgb(0, 0, 0));
+        assert_eq!(dark_module.bg, Color::Rgb(255, 255, 255));
+
+        state.entries.push_back(FlowEntry::Error {
+            message: "captured error".to_owned(),
+        });
+        let rendered = render_with_setup(&mut state, Some(&setup));
+        assert!(!rendered.contains("Scan \"proxelar-wg\""));
+        assert!(rendered.contains("captured error"));
     }
 
     #[test]
