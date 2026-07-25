@@ -806,4 +806,274 @@ mod tests {
             .unwrap()
             .matches_udp(&udp));
     }
+
+    #[test]
+    fn covers_http_filter_fields_and_parser_edges() {
+        let (request, base_response) = exchange();
+        let mut response_headers = base_response.headers().clone();
+        response_headers.insert("x-result", "finished".parse().unwrap());
+        let response = ProxiedResponse::new_with_body_metadata(
+            base_response.status(),
+            base_response.version(),
+            response_headers,
+            base_response.body().clone(),
+            base_response.body_metadata(),
+            base_response.time(),
+        );
+
+        let matching = [
+            "",
+            "post",
+            &format!("time:{}", format_time(request.time())),
+            "proto:https",
+            "method:post",
+            "host:api.example",
+            "path:/items",
+            "url:q=one",
+            "status:201",
+            "type:application/json",
+            &format!("size:{}", format_size(response.body_metadata().total_seen)),
+            &format!(
+                "duration:{}",
+                format_duration(response.time().saturating_sub(request.time()))
+            ),
+            "body:payload",
+            "request-body:request",
+            "response-body:result",
+            "header:x-result",
+            "request-header:x-trace",
+            "response-header:finished",
+            "!(method:get | status:500)",
+        ];
+        for expression in matching {
+            assert!(
+                FlowFilter::parse(expression)
+                    .unwrap()
+                    .matches(&request, Some(&response), false),
+                "filter should match: {expression}"
+            );
+        }
+
+        for expression in [
+            "status:201",
+            "type:json",
+            "response-body:result",
+            "response-header:x-result",
+        ] {
+            assert!(
+                !FlowFilter::parse(expression)
+                    .unwrap()
+                    .matches(&request, None, false),
+                "filter should require a response: {expression}"
+            );
+        }
+        assert!(FlowFilter::parse("method:get")
+            .unwrap()
+            .matches(&request, Some(&response), true));
+        assert!(FlowFilter::parse("proto:ws").unwrap().matches(
+            &ProxiedRequest::new(
+                Method::GET,
+                "http://example.test/socket".parse().unwrap(),
+                Version::HTTP_11,
+                HeaderMap::new(),
+                Bytes::new(),
+                1,
+            ),
+            Some(&response),
+            true,
+        ));
+
+        for invalid in [
+            ")",
+            "& value",
+            "value )",
+            "value &",
+            "~h )",
+            "\"unterminated",
+            "body:'unterminated",
+        ] {
+            assert!(
+                FlowFilter::parse(invalid).is_err(),
+                "filter should reject: {invalid}"
+            );
+        }
+        assert!(FlowFilter::parse(r#"body:"request \"payload\"""#).is_ok());
+        assert!(!FlowFilter::parse("unknown:value").unwrap().matches(
+            &request,
+            Some(&response),
+            false
+        ));
+    }
+
+    #[test]
+    fn covers_transport_filter_fields_and_helpers() {
+        let stream = CapturedTcpStream {
+            id: 1,
+            target: "cache.example.test:6379".to_owned(),
+            opened_at: 1_000,
+            chunks: vec![proxyapi_models::TcpChunk {
+                direction: proxyapi_models::StreamDirection::ClientToServer,
+                time: 1_001,
+                payload: Bytes::from_static(b"SET key value"),
+                truncated: false,
+            }],
+            closed: false,
+        };
+        for expression in [
+            "cache.example",
+            &format!("time:{}", format_time(stream.opened_at)),
+            "proto:tcp",
+            "type:binary",
+            "host:6379",
+            "path:cache",
+            "url:example",
+            "status:live",
+            &format!(
+                "size:{}",
+                format_size(stream.chunks.iter().map(|chunk| chunk.payload.len()).sum())
+            ),
+            "body:value",
+            "request-body:key",
+            "response-body:set",
+        ] {
+            assert!(
+                FlowFilter::parse(expression).unwrap().matches_tcp(&stream),
+                "TCP filter should match: {expression}"
+            );
+        }
+        for expression in [
+            "method:get",
+            "header:value",
+            "request-header:value",
+            "response-header:value",
+            "duration:1ms",
+        ] {
+            assert!(!FlowFilter::parse(expression).unwrap().matches_tcp(&stream));
+        }
+
+        let (request, response) = exchange();
+        let frame = WsFrame::new(
+            proxyapi_models::WsDirection::ClientToServer,
+            proxyapi_models::WsOpcode::Binary,
+            1_100,
+            Bytes::from_static(b"frame payload"),
+            false,
+        );
+        assert!(FlowFilter::parse("body:frame").unwrap().matches_websocket(
+            &request,
+            &response,
+            &[frame],
+            false
+        ));
+        assert!(FlowFilter::parse("status:live").unwrap().matches_websocket(
+            &request,
+            &response,
+            &[],
+            false
+        ));
+
+        for (query_type, label) in [
+            (1, "a"),
+            (2, "ns"),
+            (5, "cname"),
+            (12, "ptr"),
+            (15, "mx"),
+            (16, "txt"),
+            (28, "aaaa"),
+            (33, "srv"),
+            (65, "https"),
+            (255, "other"),
+        ] {
+            let dns = CapturedDnsExchange {
+                id: 2,
+                name: "api.example.test".to_owned(),
+                query_type,
+                time: 1_000,
+                answers: vec!["127.0.0.1".to_owned()],
+                overridden: false,
+                completed: false,
+            };
+            assert!(FlowFilter::parse(&format!("method:{label}"))
+                .unwrap()
+                .matches_dns(&dns));
+        }
+        let mut dns = CapturedDnsExchange {
+            id: 2,
+            name: "api.example.test".to_owned(),
+            query_type: 1,
+            time: 1_000,
+            answers: vec!["127.0.0.1".to_owned()],
+            overridden: false,
+            completed: false,
+        };
+        for expression in [
+            &format!("time:{}", format_time(dns.time)),
+            "host:api.example",
+            "path:example",
+            "url:api",
+            "status:pending",
+            "size:9b",
+            "request-body:127.0.0.1",
+            "response-body:127.0.0.1",
+        ] {
+            assert!(FlowFilter::parse(expression).unwrap().matches_dns(&dns));
+        }
+        for expression in [
+            "header:any",
+            "request-header:any",
+            "response-header:any",
+            "duration:1ms",
+        ] {
+            assert!(!FlowFilter::parse(expression).unwrap().matches_dns(&dns));
+        }
+        dns.completed = true;
+        assert!(FlowFilter::parse("status:upstream")
+            .unwrap()
+            .matches_dns(&dns));
+        dns.overridden = true;
+        assert!(FlowFilter::parse("status:override")
+            .unwrap()
+            .matches_dns(&dns));
+
+        let udp = CapturedUdpExchange {
+            id: 3,
+            target: "127.0.0.1:9000".to_owned(),
+            client: "127.0.0.1:50000".to_owned(),
+            time: 1_000,
+            request: Bytes::from_static(b"ping"),
+            response: Bytes::from_static(b"pong"),
+            response_received: false,
+            request_truncated: false,
+            response_truncated: false,
+        };
+        for expression in [
+            "50000",
+            &format!("time:{}", format_time(udp.time)),
+            "method:datagram",
+            "host:9000",
+            "path:127.0.0.1",
+            "url:9000",
+            "status:no-response",
+            "type:binary",
+            "size:8b",
+            "body:pong",
+            "request-body:ping",
+            "response-body:pong",
+        ] {
+            assert!(FlowFilter::parse(expression).unwrap().matches_udp(&udp));
+        }
+        for expression in [
+            "header:any",
+            "request-header:any",
+            "response-header:any",
+            "duration:1ms",
+        ] {
+            assert!(!FlowFilter::parse(expression).unwrap().matches_udp(&udp));
+        }
+
+        assert_eq!(format_size(1_024), "1.0kb");
+        assert_eq!(format_size(1_048_576), "1.0mb");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_000), "1.0s");
+    }
 }

@@ -633,4 +633,234 @@ mod tests {
             .unwrap()
             .unwrap();
     }
+
+    #[test]
+    fn validates_endpoints_existing_keys_and_debug_redaction() {
+        for endpoint in ["vpn.example:51820", "127.0.0.1:51820", "[::1]:51820"] {
+            validate_endpoint(endpoint).unwrap();
+        }
+        for endpoint in [
+            "",
+            "vpn.example",
+            "http://vpn.example:51820",
+            "host:\n51820",
+        ] {
+            assert_eq!(
+                validate_endpoint(endpoint).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key");
+        let key = [42_u8; 32];
+        std::fs::write(&path, format!("  {}\n", encode_key(&key))).unwrap();
+        assert_eq!(load_or_generate_key(&path).unwrap(), key);
+        std::fs::write(&path, "not-base64").unwrap();
+        assert_eq!(
+            load_or_generate_key(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            decode_key(&encode_key(&[1_u8; 16].repeat(2).try_into().unwrap())).unwrap(),
+            [1_u8; 32]
+        );
+
+        let config = WireGuardConfig::from_base64(
+            &encode_key(&[7_u8; 32]),
+            &encode_key(&[9_u8; 32]),
+            DnsConfig::new("127.0.0.1:53".parse().unwrap()),
+        )
+        .unwrap();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&encode_key(&[7_u8; 32])));
+        assert_eq!(config.server_public_key().len(), 44);
+    }
+
+    #[tokio::test]
+    async fn replay_receivers_and_cancelled_loops_stop_cleanly() {
+        let request = ProxiedRequest::new(
+            http::Method::GET,
+            "http://example.test/".parse().unwrap(),
+            http::Version::HTTP_11,
+            http::HeaderMap::new(),
+            bytes::Bytes::new(),
+            1,
+        );
+        let (request_tx, request_rx) = mpsc::channel(1);
+        request_tx.send(request).await.unwrap();
+        let mut request_rx = Some(request_rx);
+        assert_eq!(
+            receive_replay(&mut request_rx).await.unwrap().uri().host(),
+            Some("example.test")
+        );
+        drop(request_tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receive_replay(&mut request_rx))
+                .await
+                .is_err()
+        );
+        let mut absent = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receive_replay(&mut absent))
+                .await
+                .is_err()
+        );
+
+        let (stack, _, _, _) = StackBuilder::default().build().unwrap();
+        let (_decrypted_tx, decrypted_rx) = mpsc::channel(1);
+        let (encrypted_tx, _encrypted_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        stack_bridge(stack, decrypted_rx, encrypted_tx, cancel)
+            .await
+            .unwrap();
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = WireGuardConfig::from_base64(
+            &encode_key(&[7_u8; 32]),
+            &encode_key(&[9_u8; 32]),
+            DnsConfig::new("127.0.0.1:53".parse().unwrap()),
+        )
+        .unwrap();
+        let (decrypted_tx, _decrypted_rx) = mpsc::channel(1);
+        let (_encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        wireguard_loop(
+            socket,
+            Peer::new(&config),
+            decrypted_tx,
+            encrypted_rx,
+            cancel,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_processors_complete_a_handshake_and_exchange_packets() {
+        let mut server_key = [0_u8; 32];
+        let mut client_key = [0_u8; 32];
+        openssl::rand::rand_bytes(&mut server_key).unwrap();
+        openssl::rand::rand_bytes(&mut client_key).unwrap();
+        let server_private = StaticSecret::from(server_key);
+        let client_private = StaticSecret::from(client_key);
+        let server_public = PublicKey::from(&server_private);
+        let client_public = PublicKey::from(&client_private);
+        let config = WireGuardConfig {
+            server_private_key: server_key,
+            peer_public_key: *client_public.as_bytes(),
+            dns: DnsConfig::new("127.0.0.1:53".parse().unwrap()),
+        };
+        let mut peer = Peer::new(&config);
+        let mut client = Tunn::new(client_private, server_public, None, None, 1, None);
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_address = client_socket.local_addr().unwrap();
+        let (decrypted_tx, mut decrypted_rx) = mpsc::channel(4);
+        let mut client_output = vec![0_u8; 2_048];
+        let initiation = match client.format_handshake_initiation(&mut client_output, false) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("unexpected initiation result: {other:?}"),
+        };
+        let mut server_output = vec![0_u8; MAX_PACKET_SIZE];
+        process_incoming(
+            &server_socket,
+            &mut peer,
+            client_address,
+            &initiation,
+            &mut server_output,
+            &decrypted_tx,
+        )
+        .await
+        .unwrap();
+        let mut handshake = vec![0_u8; 2_048];
+        let (handshake_len, _) = client_socket.recv_from(&mut handshake).await.unwrap();
+        let _ = client.decapsulate(
+            Some(server_socket.local_addr().unwrap().ip()),
+            &handshake[..handshake_len],
+            &mut client_output,
+        );
+        assert_eq!(peer.endpoint, Some(client_address));
+
+        let mut ipv4 = vec![0_u8; 20];
+        ipv4[0] = 0x45;
+        ipv4[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        let encrypted = match client.encapsulate(&ipv4, &mut client_output) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            other => panic!("unexpected encryption result: {other:?}"),
+        };
+        process_incoming(
+            &server_socket,
+            &mut peer,
+            client_address,
+            &encrypted,
+            &mut server_output,
+            &decrypted_tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decrypted_rx.recv().await.unwrap(), ipv4);
+
+        let response_packet = vec![0x45; 20];
+        process_outgoing(
+            &server_socket,
+            &mut peer,
+            &response_packet,
+            &mut server_output,
+        )
+        .await
+        .unwrap();
+        let (encrypted_len, _) = client_socket.recv_from(&mut handshake).await.unwrap();
+        assert!(encrypted_len > 0);
+        let _ = client.decapsulate(
+            Some(server_socket.local_addr().unwrap().ip()),
+            &handshake[..encrypted_len],
+            &mut client_output,
+        );
+        process_timer(&server_socket, &mut peer, &mut server_output)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_processors_drop_invalid_oversized_and_unroutable_packets() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = WireGuardConfig::from_base64(
+            &encode_key(&[7_u8; 32]),
+            &encode_key(&[9_u8; 32]),
+            DnsConfig::new("127.0.0.1:53".parse().unwrap()),
+        )
+        .unwrap();
+        let mut peer = Peer::new(&config);
+        let (decrypted_tx, mut decrypted_rx) = mpsc::channel(1);
+        let mut output = vec![0_u8; MAX_PACKET_SIZE];
+        process_incoming(
+            &server_socket,
+            &mut peer,
+            "127.0.0.1:9".parse().unwrap(),
+            b"invalid",
+            &mut output,
+            &decrypted_tx,
+        )
+        .await
+        .unwrap();
+        assert!(decrypted_rx.try_recv().is_err());
+        process_outgoing(&server_socket, &mut peer, b"small", &mut output)
+            .await
+            .unwrap();
+        process_outgoing(
+            &server_socket,
+            &mut peer,
+            &vec![0_u8; MAX_PACKET_SIZE],
+            &mut output,
+        )
+        .await
+        .unwrap();
+        process_timer(&server_socket, &mut peer, &mut output)
+            .await
+            .unwrap();
+    }
 }

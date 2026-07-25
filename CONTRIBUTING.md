@@ -91,7 +91,7 @@ cargo llvm-cov --workspace --all-features --locked \
   --ignore-filename-regex '(^|/)(tests|target)/' \
   --fail-under-lines 80
 
-cargo llvm-cov -p proxyapi --all-features --locked \
+cargo llvm-cov report -p proxyapi \
   --ignore-filename-regex '(^|/)(tests|target)/' \
   --fail-under-lines 90
 ```

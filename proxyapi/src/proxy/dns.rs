@@ -379,4 +379,80 @@ mod tests {
         assert_eq!(response_id, id);
         assert!(overridden);
     }
+
+    #[test]
+    fn rejects_truncated_and_malformed_dns_packets() {
+        assert_eq!(
+            parse_query(&[]).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut packet = vec![0_u8; 17];
+        assert!(parse_query(&packet).is_err());
+        packet[5] = 1;
+        packet[12] = 0xc0;
+        assert!(parse_query(&packet).is_err());
+        packet[12] = 64;
+        assert!(parse_query(&packet).is_err());
+
+        let mut invalid_utf8 = vec![0_u8; 12];
+        invalid_utf8[5] = 1;
+        invalid_utf8.extend_from_slice(&[1, 0xff, 0, 0, 1, 0, 1]);
+        assert!(parse_query(&invalid_utf8).is_err());
+
+        let mut missing_question = vec![0_u8; 12];
+        missing_question[5] = 1;
+        missing_question.push(0);
+        assert!(parse_query(&missing_question).is_err());
+
+        assert!(parse_answers(&[]).is_err());
+        let mut missing_name = vec![0_u8; 12];
+        missing_name[5] = 1;
+        assert!(parse_answers(&missing_name).is_err());
+        let mut invalid_name = vec![0_u8; 12];
+        invalid_name[7] = 1;
+        invalid_name.push(64);
+        assert!(parse_answers(&invalid_name).is_err());
+        let mut truncated_pointer = vec![0_u8; 12];
+        truncated_pointer[7] = 1;
+        truncated_pointer.push(0xc0);
+        assert!(parse_answers(&truncated_pointer).is_err());
+
+        let mut missing_fields = vec![0_u8; 12];
+        missing_fields[7] = 1;
+        missing_fields.push(0);
+        assert!(parse_answers(&missing_fields).is_err());
+
+        let mut missing_data = vec![0_u8; 12];
+        missing_data[7] = 1;
+        missing_data.push(0);
+        missing_data.extend_from_slice(&1_u16.to_be_bytes());
+        missing_data.extend_from_slice(&1_u16.to_be_bytes());
+        missing_data.extend_from_slice(&30_u32.to_be_bytes());
+        missing_data.extend_from_slice(&4_u16.to_be_bytes());
+        assert!(parse_answers(&missing_data).is_err());
+
+        let mut ignored_record = vec![0_u8; 12];
+        ignored_record[7] = 1;
+        ignored_record.push(0);
+        ignored_record.extend_from_slice(&16_u16.to_be_bytes());
+        ignored_record.extend_from_slice(&1_u16.to_be_bytes());
+        ignored_record.extend_from_slice(&30_u32.to_be_bytes());
+        ignored_record.extend_from_slice(&1_u16.to_be_bytes());
+        ignored_record.push(b'x');
+        assert!(parse_answers(&ignored_record).unwrap().is_empty());
+
+        let parsed = Query {
+            name: "example.test".to_owned(),
+            query_type: 1,
+            question_end: 100,
+        };
+        assert!(override_response(
+            &query("example.test", 1),
+            &parsed,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            30
+        )
+        .is_err());
+    }
 }

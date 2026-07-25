@@ -1028,4 +1028,394 @@ mod tests {
     fn shell_quote_handles_single_quotes() {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
+
+    #[test]
+    fn recorder_updates_all_flow_types_and_replays_session_events() {
+        let captured = flow(11);
+        let mut recorder = SessionRecorder::new(1);
+        for response_status in [StatusCode::OK, StatusCode::CREATED] {
+            let response = ProxiedResponse::new_with_body_metadata(
+                response_status,
+                captured.response.version(),
+                captured.response.headers().clone(),
+                captured.response.body().clone(),
+                captured.response.body_metadata(),
+                captured.response.time(),
+            );
+            recorder.record(&ProxyEvent::RequestComplete {
+                id: captured.id,
+                request: Box::new(captured.request.clone()),
+                response: Box::new(response),
+            });
+        }
+        recorder.record(&ProxyEvent::WebSocketConnected {
+            id: 12,
+            request: Box::new(captured.request.clone()),
+            response: Box::new(captured.response.clone()),
+        });
+        recorder.record(&ProxyEvent::WebSocketConnected {
+            id: 12,
+            request: Box::new(captured.request.clone()),
+            response: Box::new(captured.response.clone()),
+        });
+        let frame = proxyapi_models::WsFrame::new(
+            proxyapi_models::WsDirection::ClientToServer,
+            proxyapi_models::WsOpcode::Text,
+            2,
+            Bytes::from_static(b"hello"),
+            false,
+        );
+        recorder.record(&ProxyEvent::WebSocketFrame {
+            conn_id: 12,
+            frame: Box::new(frame.clone()),
+        });
+        recorder.record(&ProxyEvent::WebSocketFrame {
+            conn_id: 999,
+            frame: Box::new(frame),
+        });
+        recorder.record(&ProxyEvent::WebSocketClosed { conn_id: 12 });
+        recorder.record(&ProxyEvent::WebSocketClosed { conn_id: 999 });
+
+        recorder.record(&ProxyEvent::TcpConnected {
+            id: 13,
+            target: "127.0.0.1:9000".to_owned(),
+            opened_at: 3,
+        });
+        let chunk = proxyapi_models::TcpChunk {
+            direction: proxyapi_models::StreamDirection::ClientToServer,
+            time: 4,
+            payload: Bytes::from_static(b"payload"),
+            truncated: false,
+        };
+        recorder.record(&ProxyEvent::TcpData {
+            stream_id: 13,
+            chunk: Box::new(chunk.clone()),
+        });
+        recorder.record(&ProxyEvent::TcpData {
+            stream_id: 999,
+            chunk: Box::new(chunk),
+        });
+        recorder.record(&ProxyEvent::TcpClosed { stream_id: 13 });
+        recorder.record(&ProxyEvent::TcpClosed { stream_id: 999 });
+
+        recorder.record(&ProxyEvent::DnsQuery {
+            id: 14,
+            name: "example.test".to_owned(),
+            query_type: 1,
+            time: 5,
+        });
+        recorder.record(&ProxyEvent::DnsResponse {
+            id: 14,
+            answers: vec!["127.0.0.1".to_owned()],
+            overridden: false,
+        });
+        recorder.record(&ProxyEvent::DnsResponse {
+            id: 999,
+            answers: Vec::new(),
+            overridden: false,
+        });
+
+        let udp = proxyapi_models::CapturedUdpExchange {
+            id: 15,
+            target: "127.0.0.1:9001".to_owned(),
+            client: "127.0.0.1:50000".to_owned(),
+            time: 6,
+            request: Bytes::from_static(b"request"),
+            response: Bytes::from_static(b"response"),
+            response_received: true,
+            request_truncated: false,
+            response_truncated: false,
+        };
+        recorder.record(&ProxyEvent::UdpExchange {
+            exchange: Box::new(udp.clone()),
+        });
+        recorder.record(&ProxyEvent::UdpExchange {
+            exchange: Box::new(udp),
+        });
+
+        assert_eq!(recorder.session().flows.len(), 1);
+        assert_eq!(
+            recorder.session().flows[0].response.status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(recorder.session().websockets[0].frames.len(), 1);
+        assert!(recorder.session().tcp_streams[0].closed);
+        assert_eq!(recorder.session().tcp_streams[0].chunks.len(), 1);
+        assert_eq!(recorder.session().udp_exchanges.len(), 1);
+
+        let snapshot = recorder.snapshot();
+        let events = session_events(&snapshot);
+        assert_eq!(events.len(), 10);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProxyEvent::WebSocketClosed { conn_id: 12 })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProxyEvent::TcpClosed { stream_id: 13 })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProxyEvent::DnsResponse { id: 14, .. })));
+
+        recorder.clear();
+        assert!(recorder.session().flows.is_empty());
+        assert!(recorder.session().websockets.is_empty());
+        assert!(recorder.session().tcp_streams.is_empty());
+        assert!(recorder.session().dns_exchanges.is_empty());
+        assert!(recorder.session().udp_exchanges.is_empty());
+
+        let default_recorder = SessionRecorder::default();
+        assert!(default_recorder.session().created_at > 0);
+    }
+
+    #[test]
+    fn rejects_invalid_native_sessions_and_redacts_custom_values() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("capture.pxsession");
+
+        let mut unsupported = TrafficSession::new(1);
+        unsupported.version = SESSION_FORMAT_VERSION + 1;
+        assert!(matches!(
+            SessionRecorder::from_session(unsupported.clone()),
+            Err(SessionError::UnsupportedVersion { .. })
+        ));
+        assert!(matches!(
+            save_session(&path, &unsupported),
+            Err(SessionError::UnsupportedVersion { .. })
+        ));
+        std::fs::write(&path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        assert!(matches!(
+            load_session(&path),
+            Err(SessionError::UnsupportedVersion { .. })
+        ));
+
+        let mut maximum = TrafficSession::new(1);
+        maximum.flows.push(flow(u64::MAX));
+        assert!(matches!(
+            SessionRecorder::from_session(maximum),
+            Err(SessionError::InvalidSession(_))
+        ));
+
+        std::fs::write(&path, "{invalid").unwrap();
+        assert!(matches!(load_session(&path), Err(SessionError::Json(_))));
+        assert!(matches!(
+            load_session(directory.path().join("missing")),
+            Err(SessionError::Io(_))
+        ));
+
+        let policy = RedactionPolicy::new(["authorization", "bad header"], ["secret"])
+            .with_replacement("hidden");
+        let request = ProxiedRequest::new(
+            Method::GET,
+            "https://example.test/path?secret=value&flag&other=visible"
+                .parse()
+                .unwrap(),
+            Version::HTTP_11,
+            HeaderMap::from_iter([(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer secret"),
+            )]),
+            Bytes::new(),
+            1,
+        );
+        let redacted = policy.redact_request(&request);
+        assert_eq!(redacted.headers()[http::header::AUTHORIZATION], "hidden");
+        assert_eq!(
+            redacted.uri().query(),
+            Some("secret=hidden&flag&other=visible")
+        );
+
+        let unchanged: Uri = "https://example.test/no-query".parse().unwrap();
+        assert_eq!(policy.redact_uri(&unchanged), unchanged);
+        let visible: Uri = "https://example.test/?other=value".parse().unwrap();
+        assert_eq!(policy.redact_uri(&visible), visible);
+
+        let invalid_replacement =
+            RedactionPolicy::new(["authorization"], std::iter::empty::<&str>())
+                .with_replacement("bad\nvalue");
+        assert_eq!(
+            invalid_replacement.redact_headers(request.headers())[http::header::AUTHORIZATION],
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn imports_har_variants_and_reports_invalid_entries() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("capture.har");
+        let write = |value: Value| {
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        };
+
+        write(json!({}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHar(_))
+        ));
+        write(json!({"log": {"entries": [{}]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHar(_))
+        ));
+        write(json!({"log": {"entries": [{"request": {}}]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHar(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {"url": "https://example.test", "method": "bad method"},
+            "response": {}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHttp(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {"method": "GET"},
+            "response": {}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHar(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {"url": "http://[", "method": "GET"},
+            "response": {}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHttp(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {"url": "https://example.test", "method": "GET"},
+            "response": {"status": 99}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHttp(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {
+                "url": "https://example.test",
+                "headers": [{"name": "bad header", "value": "value"}]
+            },
+            "response": {}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHttp(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {
+                "url": "https://example.test",
+                "headers": [{"name": "x-test", "value": "bad\nvalue"}]
+            },
+            "response": {}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHttp(_))
+        ));
+        write(json!({"log": {"entries": [{
+            "request": {"url": "https://example.test"},
+            "response": {"content": {"text": "***", "encoding": "base64"}}
+        }]}}));
+        assert!(matches!(
+            import_har(&path),
+            Err(SessionError::InvalidHar(_))
+        ));
+
+        write(json!({"log": {"entries": [{
+            "startedDateTime": "2020-01-02T03:04:05Z",
+            "time": 12.5,
+            "request": {
+                "method": "POST",
+                "url": "https://example.test/upload",
+                "httpVersion": "HTTP/2.0",
+                "headers": [
+                    {"name": "x-repeat", "value": "one"},
+                    {"name": "x-repeat", "value": "two"},
+                    {"name": "ignored"}
+                ],
+                "postData": {"text": "aGVsbG8=", "encoding": "base64"}
+            },
+            "response": {
+                "status": 201,
+                "httpVersion": "HTTP/3.0",
+                "headers": [],
+                "content": {"text": "created"}
+            }
+        }]}}));
+        let imported = import_har(&path).unwrap();
+        assert_eq!(imported.flows.len(), 1);
+        assert_eq!(imported.flows[0].request.version(), Version::HTTP_2);
+        assert_eq!(imported.flows[0].response.version(), Version::HTTP_3);
+        assert_eq!(imported.flows[0].request.body().as_ref(), b"hello");
+        assert_eq!(
+            imported.flows[0]
+                .request
+                .headers()
+                .get_all("x-repeat")
+                .iter()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn covers_har_raw_and_http_version_helpers() {
+        let binary = Bytes::from_static(&[0, 159, 146, 150]);
+        let metadata = BodyMetadata {
+            total_seen: 100,
+            truncated: true,
+        };
+        let content = har_content(&binary, &HeaderMap::new(), metadata);
+        assert_eq!(content["encoding"], "base64");
+        assert!(content["comment"]
+            .as_str()
+            .unwrap()
+            .contains("observed 100 wire bytes"));
+        assert!(truncation_comment(BodyMetadata::complete(0)).is_none());
+
+        assert_eq!(import_har_body(None).unwrap(), Bytes::new());
+        assert_eq!(import_har_body(Some(&json!({}))).unwrap(), Bytes::new());
+        assert_eq!(
+            import_har_body(Some(&json!({"text": "plain"})))
+                .unwrap()
+                .as_ref(),
+            b"plain"
+        );
+        assert!(import_har_headers(Some(&json!([
+            {"value": "missing-name"},
+            {"name": "missing-value"}
+        ])))
+        .unwrap()
+        .is_empty());
+
+        for (text, expected, rendered) in [
+            ("HTTP/0.9", Version::HTTP_09, "HTTP/0.9"),
+            ("HTTP/1.0", Version::HTTP_10, "HTTP/1.0"),
+            ("HTTP/1.1", Version::HTTP_11, "HTTP/1.1"),
+            ("HTTP/2", Version::HTTP_2, "HTTP/2"),
+            ("HTTP/2.0", Version::HTTP_2, "HTTP/2"),
+            ("HTTP/3", Version::HTTP_3, "HTTP/3"),
+            ("HTTP/3.0", Version::HTTP_3, "HTTP/3"),
+            ("unknown", Version::HTTP_11, "HTTP/1.1"),
+        ] {
+            assert_eq!(parse_version(Some(&json!(text))), expected);
+            assert_eq!(version_string(expected), rendered);
+        }
+        assert_eq!(parse_version(None), Version::HTTP_11);
+
+        let captured = flow(1);
+        let request = raw_request(&captured.request);
+        let response = raw_response(&captured.response);
+        assert!(request.starts_with(b"POST /path?token=secret HTTP/1.1\r\n"));
+        assert!(request.ends_with(b"\r\n\r\nrequest"));
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(br#"{"ok":true}"#));
+
+        let policy = RedactionPolicy::default();
+        let redacted = policy.redact_response(&captured.response);
+        assert_eq!(redacted.status(), StatusCode::OK);
+    }
 }

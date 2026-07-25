@@ -311,4 +311,192 @@ mod tests {
             assert_eq!(reply_status(&error), expected);
         }
     }
+
+    #[tokio::test]
+    async fn accepts_ipv4_and_ipv6_and_rejects_invalid_requests() {
+        async fn run_request(request: Vec<u8>) -> (Result<Authority, std::io::Error>, Vec<u8>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                accept_connect(&mut stream).await
+            });
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            let _ = client.read_to_end(&mut reply).await;
+            (server.await.unwrap(), reply)
+        }
+
+        let (authority, _) = run_request(vec![5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0, 80]).await;
+        assert_eq!(authority.unwrap().as_str(), "127.0.0.1:80");
+
+        let mut ipv6 = vec![5, 1, 0, 5, 1, 0, ADDRESS_IPV6];
+        ipv6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        ipv6.extend_from_slice(&443_u16.to_be_bytes());
+        let (authority, _) = run_request(ipv6).await;
+        assert_eq!(authority.unwrap().as_str(), "[::1]:443");
+
+        let (error, _) = run_request(vec![4, 0]).await;
+        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+        let (error, _) =
+            run_request(vec![5, 1, 0, 5, 2, 0, ADDRESS_IPV4, 127, 0, 0, 1, 0, 80]).await;
+        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+
+        let (error, _) = run_request(vec![5, 1, 0, 5, 1, 0, 9]).await;
+        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+
+        let (error, _) = run_request(vec![5, 1, 0, 5, 1, 0, ADDRESS_DOMAIN, 1, 0xff, 0, 80]).await;
+        assert_eq!(error.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn sends_ipv4_and_ipv6_replies_and_connects_directly() {
+        async fn reply(bound: Option<SocketAddr>) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                send_reply(&mut stream, 0, bound).await.unwrap();
+            });
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            server.await.unwrap();
+            bytes
+        }
+
+        assert_eq!(reply(None).await, [5, 0, 0, ADDRESS_IPV4, 0, 0, 0, 0, 0, 0]);
+        let ipv4 = reply(Some("127.0.0.1:8080".parse().unwrap())).await;
+        assert_eq!(ipv4[3], ADDRESS_IPV4);
+        assert_eq!(&ipv4[4..8], &[127, 0, 0, 1]);
+        let ipv6 = reply(Some("[::1]:8080".parse().unwrap())).await;
+        assert_eq!(ipv6[3], ADDRESS_IPV6);
+        assert_eq!(ipv6.len(), 22);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+        let mut outbound = OutboundConnector::new(None).unwrap();
+        let mut connected = connect_target(
+            &target.to_string().parse::<Authority>().unwrap(),
+            &mut outbound,
+        )
+        .await
+        .unwrap();
+        connected.write_all(b"ping").await.unwrap();
+        let mut response = [0_u8; 4];
+        connected.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_mode_tunnels_unknown_tcp_streams() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(&request).await.unwrap();
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let directory = tempfile::tempdir().unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let proxy = crate::Proxy::new(crate::ProxyConfig {
+            addr: address,
+            mode: crate::ProxyMode::Socks5,
+            event_tx,
+            ca_dir: directory.path().to_owned(),
+            upstream_tls: crate::UpstreamTlsConfig::Default,
+            intercept: None,
+            body_capture_limit: Some(1_024),
+            #[cfg(feature = "scripting")]
+            script_path: None,
+            replay_rx: None,
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let proxy_task = tokio::spawn(proxy.start(async {
+            let _ = shutdown_rx.await;
+        }));
+        let mut client = None;
+        for _ in 0..100 {
+            match TcpStream::connect(address).await {
+                Ok(stream) => {
+                    client = Some(stream);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("failed to connect to SOCKS listener: {error}"),
+            }
+        }
+        let mut client = client.expect("SOCKS listener did not start");
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0_u8; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [5, 0]);
+        let mut request = vec![5, 1, 0, ADDRESS_IPV4];
+        let IpAddr::V4(target_ip) = target.ip() else {
+            panic!("expected IPv4 target");
+        };
+        request.extend_from_slice(&target_ip.octets());
+        request.extend_from_slice(&target.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+
+        client.write_all(&[0, 1, 2, 3]).await.unwrap();
+        let mut echoed = [0_u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, [0, 1, 2, 3]);
+        drop(client);
+        upstream_task.await.unwrap();
+
+        let mut saw_connection = false;
+        let mut saw_client_data = false;
+        for _ in 0..4 {
+            let Some(event) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                    .await
+                    .unwrap()
+            else {
+                break;
+            };
+            match event {
+                crate::ProxyEvent::TcpConnected {
+                    target: captured, ..
+                } => {
+                    saw_connection = captured == target.to_string();
+                }
+                crate::ProxyEvent::TcpData { chunk, .. }
+                    if chunk.direction == proxyapi_models::StreamDirection::ClientToServer =>
+                {
+                    saw_client_data = chunk.payload.as_ref() == [0, 1, 2, 3];
+                }
+                crate::ProxyEvent::TcpClosed { .. } if saw_connection && saw_client_data => break,
+                _ => {}
+            }
+        }
+        assert!(saw_connection);
+        assert!(saw_client_data);
+
+        shutdown_tx.send(()).unwrap();
+        proxy_task.await.unwrap().unwrap();
+    }
 }

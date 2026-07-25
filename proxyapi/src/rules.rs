@@ -535,4 +535,305 @@ mod tests {
 
         assert!(error.to_string().contains("symlink escapes"));
     }
+
+    #[test]
+    fn loads_builds_and_validates_every_rule_shape() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rules.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "rules": [
+                    {
+                        "action": "redirect",
+                        "url_prefix": "https://old.test/",
+                        "location": "https://new.test/"
+                    },
+                    {
+                        "action": "mock",
+                        "url_prefix": "https://api.test/",
+                        "headers": [{"name": "x-test", "value": "yes"}],
+                        "body": "ok"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = RouteRules::load(&path).unwrap();
+        assert_eq!(loaded.rules.len(), 2);
+        assert!(matches!(
+            loaded.rules[0],
+            RouteRule::Redirect { status: 302, .. }
+        ));
+        assert!(matches!(
+            loaded.rules[1],
+            RouteRule::Mock { status: 200, .. }
+        ));
+
+        let mut built = RouteRules::default();
+        built
+            .map_remote("https://old.test/", "https://new.test/")
+            .unwrap();
+        built
+            .map_local("https://local.test/", directory.path())
+            .unwrap();
+        assert_eq!(built.rules.len(), 2);
+
+        assert!(matches!(
+            RouteRules::load(directory.path().join("missing.json")),
+            Err(RuleError::Io(_))
+        ));
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(matches!(RouteRules::load(&path), Err(RuleError::Json(_))));
+
+        let invalid_rules = [
+            RouteRule::MapRemote {
+                url_prefix: String::new(),
+                target_prefix: "https://target.test".to_owned(),
+            },
+            RouteRule::MapRemote {
+                url_prefix: "https://source.test".to_owned(),
+                target_prefix: String::new(),
+            },
+            RouteRule::MapLocal {
+                url_prefix: "https://source.test".to_owned(),
+                directory: PathBuf::new(),
+                index: "index.html".to_owned(),
+            },
+            RouteRule::MapLocal {
+                url_prefix: "https://source.test".to_owned(),
+                directory: directory.path().to_owned(),
+                index: String::new(),
+            },
+            RouteRule::Redirect {
+                url_prefix: "https://source.test".to_owned(),
+                location: String::new(),
+                status: 302,
+            },
+            RouteRule::Mock {
+                url_prefix: "https://source.test".to_owned(),
+                method: Some("bad method".to_owned()),
+                status: 200,
+                headers: Vec::new(),
+                body: String::new(),
+            },
+            RouteRule::Mock {
+                url_prefix: "https://source.test".to_owned(),
+                method: None,
+                status: 99,
+                headers: Vec::new(),
+                body: String::new(),
+            },
+            RouteRule::Mock {
+                url_prefix: "https://source.test".to_owned(),
+                method: None,
+                status: 200,
+                headers: vec![RuleHeader {
+                    name: "bad header".to_owned(),
+                    value: "value".to_owned(),
+                }],
+                body: String::new(),
+            },
+            RouteRule::SetRequestHeader {
+                url_prefix: String::new(),
+                name: "bad header".to_owned(),
+                value: "value".to_owned(),
+            },
+            RouteRule::SetRequestHeader {
+                url_prefix: String::new(),
+                name: "x-test".to_owned(),
+                value: "bad\nvalue".to_owned(),
+            },
+            RouteRule::RemoveRequestHeader {
+                url_prefix: String::new(),
+                name: "bad header".to_owned(),
+            },
+        ];
+        for rule in invalid_rules {
+            assert!(RouteRules { rules: vec![rule] }.validate().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_header_redirect_mock_and_local_edge_cases() {
+        let directory = tempdir().unwrap();
+        std::fs::write(directory.path().join("index.html"), "home").unwrap();
+        std::fs::write(directory.path().join("styles.css"), "body {}").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-remove", "gone".parse().unwrap());
+        let rules = RouteRules {
+            rules: vec![
+                RouteRule::SetRequestHeader {
+                    url_prefix: String::new(),
+                    name: "x-added".to_owned(),
+                    value: "present".to_owned(),
+                },
+                RouteRule::RemoveRequestHeader {
+                    url_prefix: "https://site.test/".to_owned(),
+                    name: "x-remove".to_owned(),
+                },
+                RouteRule::Redirect {
+                    url_prefix: "https://site.test/old".to_owned(),
+                    location: "https://site.test/new".to_owned(),
+                    status: 307,
+                },
+            ],
+        };
+        let mut uri: Uri = "https://site.test/old/path".parse().unwrap();
+        let outcome = rules
+            .apply(&Method::GET, &mut uri, &mut headers)
+            .await
+            .unwrap();
+        assert_eq!(headers["x-added"], "present");
+        assert!(!headers.contains_key("x-remove"));
+        let RuleOutcome::Respond {
+            status,
+            headers,
+            body,
+        } = outcome
+        else {
+            panic!("expected redirect");
+        };
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            headers[http::header::LOCATION],
+            "https://site.test/new/path"
+        );
+        assert!(body.is_empty());
+
+        let local = RouteRules {
+            rules: vec![RouteRule::MapLocal {
+                url_prefix: "https://site.test/".to_owned(),
+                directory: directory.path().to_owned(),
+                index: "index.html".to_owned(),
+            }],
+        };
+        let mut uri = "https://site.test/styles.css?cache=1".parse().unwrap();
+        let RuleOutcome::Respond {
+            status,
+            headers,
+            body,
+        } = local
+            .apply(&Method::HEAD, &mut uri, &mut HeaderMap::new())
+            .await
+            .unwrap()
+        else {
+            panic!("expected local response");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[http::header::CONTENT_TYPE],
+            "text/css; charset=utf-8"
+        );
+        assert!(body.is_empty());
+
+        let mut uri = "https://site.test/index.html".parse().unwrap();
+        assert!(matches!(
+            local
+                .apply(&Method::POST, &mut uri, &mut HeaderMap::new())
+                .await
+                .unwrap(),
+            RuleOutcome::Respond {
+                status: StatusCode::METHOD_NOT_ALLOWED,
+                ..
+            }
+        ));
+
+        let missing_directory = RouteRules {
+            rules: vec![RouteRule::MapLocal {
+                url_prefix: "https://missing.test/".to_owned(),
+                directory: directory.path().join("missing"),
+                index: "index.html".to_owned(),
+            }],
+        };
+        let mut uri = "https://missing.test/".parse().unwrap();
+        assert!(matches!(
+            missing_directory
+                .apply(&Method::GET, &mut uri, &mut HeaderMap::new())
+                .await
+                .unwrap(),
+            RuleOutcome::Respond {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
+
+        let mut uri = "https://site.test/missing.txt".parse().unwrap();
+        assert!(matches!(
+            local
+                .apply(&Method::GET, &mut uri, &mut HeaderMap::new())
+                .await
+                .unwrap(),
+            RuleOutcome::Respond {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }
+        ));
+
+        let mock = RouteRules {
+            rules: vec![RouteRule::Mock {
+                url_prefix: "https://api.test/".to_owned(),
+                method: Some("POST".to_owned()),
+                status: 202,
+                headers: vec![
+                    RuleHeader {
+                        name: "x-repeat".to_owned(),
+                        value: "one".to_owned(),
+                    },
+                    RuleHeader {
+                        name: "x-repeat".to_owned(),
+                        value: "two".to_owned(),
+                    },
+                ],
+                body: "accepted".to_owned(),
+            }],
+        };
+        let mut uri = "https://api.test/items".parse().unwrap();
+        assert!(matches!(
+            mock.apply(&Method::GET, &mut uri, &mut HeaderMap::new())
+                .await
+                .unwrap(),
+            RuleOutcome::Forward
+        ));
+        let RuleOutcome::Respond { headers, body, .. } = mock
+            .apply(&Method::POST, &mut uri, &mut HeaderMap::new())
+            .await
+            .unwrap()
+        else {
+            panic!("expected mock response");
+        };
+        assert_eq!(headers.get_all("x-repeat").iter().count(), 2);
+        assert_eq!(body, "accepted");
+
+        let invalid_remote = RouteRules {
+            rules: vec![RouteRule::MapRemote {
+                url_prefix: "https://source.test/".to_owned(),
+                target_prefix: "http://[".to_owned(),
+            }],
+        };
+        let mut uri = "https://source.test/path".parse().unwrap();
+        assert!(invalid_remote
+            .apply(&Method::GET, &mut uri, &mut HeaderMap::new())
+            .await
+            .is_err());
+
+        for (extension, expected) in [
+            ("index.htm", "text/html; charset=utf-8"),
+            ("app.js", "text/javascript; charset=utf-8"),
+            ("app.mjs", "text/javascript; charset=utf-8"),
+            ("data.json", "application/json"),
+            ("icon.svg", "image/svg+xml"),
+            ("image.png", "image/png"),
+            ("image.jpg", "image/jpeg"),
+            ("image.jpeg", "image/jpeg"),
+            ("image.gif", "image/gif"),
+            ("image.webp", "image/webp"),
+            ("readme.txt", "text/plain; charset=utf-8"),
+            ("readme.md", "text/plain; charset=utf-8"),
+            ("archive.bin", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type_for_path(Path::new(extension)), expected);
+        }
+    }
 }

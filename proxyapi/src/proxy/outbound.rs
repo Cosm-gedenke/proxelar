@@ -207,5 +207,103 @@ mod tests {
 
         let explicit = "https://example.test:8443/".parse::<Uri>().unwrap();
         assert_eq!(with_default_port(explicit.clone()), explicit);
+
+        let unknown = "custom://example.test/path".parse::<Uri>().unwrap();
+        assert_eq!(with_default_port(unknown.clone()), unknown);
+        let relative = "/path".parse::<Uri>().unwrap();
+        assert_eq!(with_default_port(relative.clone()), relative);
+    }
+
+    #[tokio::test]
+    async fn constructs_and_calls_each_connector_kind() {
+        use std::future::poll_fn;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_address = direct_listener.local_addr().unwrap();
+        let direct_server = tokio::spawn(async move {
+            let (_stream, _) = direct_listener.accept().await.unwrap();
+        });
+        let mut direct = OutboundConnector::new(None).unwrap();
+        poll_fn(|context| direct.poll_ready(context)).await.unwrap();
+        direct
+            .call(format!("http://{direct_address}/").parse().unwrap())
+            .await
+            .unwrap();
+        direct_server.await.unwrap();
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_address = http_listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let (mut stream, _) = http_listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 1_024];
+            let length = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("CONNECT "));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let http_config: UpstreamProxyConfig = format!("http://{http_address}").parse().unwrap();
+        let authenticated = http_config.clone().with_auth("user", "password");
+        assert_eq!(authenticated.username.as_deref(), Some("user"));
+        assert_eq!(authenticated.password.as_deref(), Some("password"));
+        let mut http = OutboundConnector::new(Some(&authenticated)).unwrap();
+        assert!(matches!(http, OutboundConnector::Http(_)));
+        poll_fn(|context| http.poll_ready(context)).await.unwrap();
+        http.call("http://example.test/".parse().unwrap())
+            .await
+            .unwrap();
+        http_server.await.unwrap();
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_address = socks_listener.local_addr().unwrap();
+        let socks_server = tokio::spawn(async move {
+            let (mut stream, _) = socks_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..3], &[5, 1, 0]);
+            match request[3] {
+                1 => {
+                    let mut rest = [0_u8; 6];
+                    stream.read_exact(&mut rest).await.unwrap();
+                }
+                3 => {
+                    let length = stream.read_u8().await.unwrap();
+                    let mut rest = vec![0_u8; usize::from(length) + 2];
+                    stream.read_exact(&mut rest).await.unwrap();
+                }
+                4 => {
+                    let mut rest = [0_u8; 18];
+                    stream.read_exact(&mut rest).await.unwrap();
+                }
+                other => panic!("unexpected SOCKS address type {other}"),
+            }
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+        });
+        let socks_config: UpstreamProxyConfig =
+            format!("socks5://{socks_address}").parse().unwrap();
+        let mut socks = OutboundConnector::new(Some(&socks_config)).unwrap();
+        assert!(matches!(socks, OutboundConnector::Socks5(_)));
+        poll_fn(|context| socks.poll_ready(context)).await.unwrap();
+        socks
+            .call("http://example.test/".parse().unwrap())
+            .await
+            .unwrap();
+        socks_server.await.unwrap();
+
+        let authenticated_socks = socks_config.with_auth("user", "password");
+        assert!(matches!(
+            OutboundConnector::new(Some(&authenticated_socks)).unwrap(),
+            OutboundConnector::Socks5(_)
+        ));
     }
 }

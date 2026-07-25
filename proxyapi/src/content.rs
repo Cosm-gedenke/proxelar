@@ -931,4 +931,49 @@ mod tests {
             .text
             .contains("\"items\""));
     }
+
+    #[test]
+    fn covers_content_labels_and_preview_edge_cases() {
+        for (kind, label) in [
+            (ContentKind::Json, "JSON"),
+            (ContentKind::Xml, "XML"),
+            (ContentKind::Html, "HTML"),
+            (ContentKind::Css, "CSS"),
+            (ContentKind::JavaScript, "JavaScript"),
+            (ContentKind::Form, "Form"),
+            (ContentKind::Multipart, "Multipart"),
+            (ContentKind::Image, "Image"),
+            (ContentKind::Protobuf, "Protobuf"),
+            (ContentKind::MessagePack, "MessagePack"),
+            (ContentKind::Text, "Text"),
+            (ContentKind::Binary, "Binary"),
+        ] {
+            assert_eq!(kind.label(), label);
+        }
+        assert_eq!(EditableContentFormat::Protobuf.as_str(), "protobuf");
+        assert_eq!(EditableContentFormat::MessagePack.as_str(), "messagepack");
+
+        assert!(pretty_markup("<root><unfinished").contains("<unfinished"));
+        assert!(!markup_opens_scope("<br>"));
+        assert!(!markup_opens_scope("<meta charset=\"utf-8\">"));
+        assert!(!markup_opens_scope("<!-- comment -->"));
+        assert!(markup_opens_scope("<section>"));
+
+        let missing = render_multipart(&headers("multipart/form-data", None), b"body");
+        assert!(missing.contains("boundary missing"));
+        let invalid = render_multipart(
+            &headers("multipart/form-data; boundary=\"\"", None),
+            b"body",
+        );
+        assert!(invalid.contains("invalid boundary"));
+        assert_eq!(find_bytes(b"abc", b""), None);
+
+        let preview = binary_preview(ContentKind::Binary, &vec![0xff; BINARY_PREVIEW_BYTES + 1]);
+        assert!(preview.contains("preview capped"));
+        assert_eq!(percent_decode(b"a%2Fb+%zz"), "a/b %zz");
+        assert_eq!(hex(b'0'), Some(0));
+        assert_eq!(hex(b'a'), Some(10));
+        assert_eq!(hex(b'F'), Some(15));
+        assert_eq!(hex(b'z'), None);
+    }
 }

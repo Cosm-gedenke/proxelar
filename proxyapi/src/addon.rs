@@ -499,4 +499,180 @@ mod tests {
             Err(AddonError::Symlink(_))
         ));
     }
+
+    #[test]
+    fn validates_manifest_names_paths_and_digests() {
+        for valid in ["a", "header-tagger", "addon2"] {
+            validate_name(valid).unwrap();
+        }
+        for invalid in [
+            "",
+            "Uppercase",
+            "-leading",
+            "trailing-",
+            "under_score",
+            &"a".repeat(65),
+        ] {
+            assert!(matches!(
+                validate_name(invalid),
+                Err(AddonError::InvalidName(_))
+            ));
+        }
+
+        validate_relative_path(Path::new("lib/helper.lua")).unwrap();
+        for invalid in ["", "../init.lua", "/init.lua", ADDON_MANIFEST_FILE] {
+            assert!(matches!(
+                validate_relative_path(Path::new(invalid)),
+                Err(AddonError::InvalidPath(_))
+            ));
+        }
+
+        let mut manifest = AddonManifest {
+            schema_version: ADDON_SCHEMA_VERSION,
+            name: "test-addon".to_owned(),
+            version: Version::new(1, 0, 0),
+            description: "test".to_owned(),
+            entrypoint: "init.lua".into(),
+            authors: Vec::new(),
+            license: None,
+            homepage: None,
+            hooks: BTreeSet::new(),
+            requires_native_modules: false,
+            files: BTreeMap::from([("init.lua".into(), "a".repeat(64))]),
+        };
+        validate_manifest(&manifest).unwrap();
+
+        manifest.schema_version += 1;
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(AddonError::UnsupportedSchema(_))
+        ));
+        manifest.schema_version = ADDON_SCHEMA_VERSION;
+        manifest.description = " ".to_owned();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(AddonError::EmptyDescription)
+        ));
+        manifest.description = "test".to_owned();
+        manifest.entrypoint = "missing.lua".into();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(AddonError::EntrypointNotDeclared(_))
+        ));
+        manifest.entrypoint = "init.lua".into();
+        manifest.files.insert("init.lua".into(), "ABC".to_owned());
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(AddonError::InvalidDigest { .. })
+        ));
+    }
+
+    #[test]
+    fn discovers_catalog_edges_and_refuses_overwrites() {
+        let root = tempdir().unwrap();
+        assert!(discover_addons(root.path().join("missing"))
+            .unwrap()
+            .is_empty());
+
+        let catalog_file = root.path().join("catalog-file");
+        fs::write(&catalog_file, "not a directory").unwrap();
+        assert!(matches!(
+            discover_addons(&catalog_file),
+            Err(AddonError::NotDirectory(_))
+        ));
+
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        package(&source, "header-tagger", b"return nil\n");
+        let loaded = AddonPackage::load(&source).unwrap();
+        assert_eq!(loaded.root(), source.canonicalize().unwrap());
+        assert_eq!(loaded.entrypoint(), loaded.root().join("init.lua"));
+
+        let catalog = root.path().join("catalog");
+        let first = install_addon(&source, &catalog).unwrap();
+        assert_eq!(first.manifest().name, "header-tagger");
+        assert!(matches!(
+            install_addon(&source, &catalog),
+            Err(AddonError::AlreadyInstalled(_))
+        ));
+
+        let mismatched = catalog.join("wrong-name");
+        fs::create_dir(&mismatched).unwrap();
+        package(&mismatched, "actual-name", b"return nil\n");
+        assert!(matches!(
+            find_addon(&catalog, "wrong-name"),
+            Err(AddonError::CatalogNameMismatch { .. })
+        ));
+        assert!(matches!(
+            find_addon(&catalog, "../escape"),
+            Err(AddonError::InvalidName(_))
+        ));
+
+        let later = catalog.join("z-addon");
+        fs::create_dir(&later).unwrap();
+        package(&later, "z-addon", b"return nil\n");
+        let discovered = discover_addons(&catalog).unwrap();
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|package| package.manifest().name.as_str())
+                .collect::<Vec<_>>(),
+            ["actual-name", "header-tagger", "z-addon"]
+        );
+
+        let plain_file = root.path().join("plain-file");
+        fs::write(&plain_file, "plain").unwrap();
+        assert!(matches!(
+            AddonPackage::load(&plain_file),
+            Err(AddonError::NotDirectory(_))
+        ));
+        assert!(matches!(
+            AddonPackage::load(root.path().join("does-not-exist")),
+            Err(AddonError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn reports_manifest_and_file_set_errors() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join(ADDON_MANIFEST_FILE), "{invalid").unwrap();
+        assert!(matches!(
+            AddonPackage::load(root.path()),
+            Err(AddonError::Manifest { .. })
+        ));
+
+        package(root.path(), "header-tagger", b"return nil\n");
+        let manifest_path = root.path().join(ADDON_MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"]["missing.lua"] = serde_json::Value::String("a".repeat(64));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(matches!(
+            AddonPackage::load(root.path()),
+            Err(AddonError::FileSetMismatch {
+                undeclared: None,
+                missing: Some(_)
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_stale_temporary_installation_directory() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        let catalog = root.path().join("catalog");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&catalog).unwrap();
+        package(&source, "temp-addon", b"return nil\n");
+        let stale = catalog.join(format!(
+            ".temp-addon.1.2.3.installing-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&stale).unwrap();
+
+        assert!(matches!(
+            install_addon(&source, &catalog),
+            Err(AddonError::TemporaryPathExists(path)) if path == stale
+        ));
+    }
 }
