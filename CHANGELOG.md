@@ -11,7 +11,7 @@
 
 - Show the generated WireGuard client profile as an importable QR code in the empty TUI and authenticated web GUI, and at terminal startup.
 - Add versioned native sessions, HAR import/export, curl and raw HTTP export, default secret redaction, and body truncation metadata.
-- Add shared boolean flow filters and decoded, content-aware body views across the TUI, web GUI, and REST API.
+- Add shared boolean flow filters, decoded content-aware body views, and lossless text/hex request-body editing across the TUI, web GUI, and REST API.
 - Add privilege-free WireGuard, SOCKS5, UDP DNS, and fixed-target raw UDP modes, raw TCP observation, and upstream HTTP CONNECT/SOCKS5 chaining.
 - Add lossless structured Protobuf wire-field and MessagePack JSON editors in the TUI and web intercept flows.
 - Add declarative local/remote maps, redirects, mocks, and request-header rules.
@@ -27,6 +27,11 @@
 - Reconcile stale transfer/content encoding headers and `Content-Length` after intercepted or replayed body edits.
 - Produce SHA-256 checksums, SPDX SBOMs, and GitHub provenance attestations for release artifacts.
 - Document the session compatibility policy, capture topology, architecture, and security threat model.
+
+### Fixed
+
+- Keep web GUI credentials out of query strings and downloadable assets by exchanging a URL-fragment bootstrap token for an `HttpOnly`, `SameSite=Strict` session cookie.
+- Detect extension HTTP methods such as `PROPFIND` when classifying inspected streams.
 
 ## [0.4.8] - 2026-07-18
 
