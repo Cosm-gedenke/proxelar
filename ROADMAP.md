@@ -19,7 +19,7 @@ It is not a promise of delivery order. It is the public source of truth for larg
 - Versioned native sessions plus HAR import/export, curl export, and raw HTTP export with default secret redaction.
 - Shared expression filters across the TUI and REST API, including body/header terms and boolean operators.
 - Content-aware views with gzip, br, zstd, deflate, charsets, formatted JSON/XML/HTML/forms/multipart, CSS/JavaScript highlighting, safe raster-image rendering, Protobuf/MessagePack JSON, and bounded binary previews.
-- Transparent, WireGuard, SOCKS5, DNS, and fixed-target UDP modes, raw TCP observation, and HTTP CONNECT/SOCKS5 upstream chaining.
+- WireGuard, SOCKS5, DNS, and fixed-target UDP modes, raw TCP observation, and HTTP CONNECT/SOCKS5 upstream chaining.
 - Declarative map-local, map-remote, redirect, mock, and request-header rules.
 - Bearer-token headless API for sessions, flows, replay, content views, and intercept decisions.
 - Lua hot reload and optional WebSocket frame transformation hooks.

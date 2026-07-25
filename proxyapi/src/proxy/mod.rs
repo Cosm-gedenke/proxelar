@@ -10,7 +10,6 @@ mod wireguard;
 
 use std::{error::Error as StdError, future::Future, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use http::uri::Authority;
 use hyper::body::{Body as HttpBody, Incoming};
 use hyper::header::{
     HeaderName, CONNECTION, COOKIE, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
@@ -192,9 +191,6 @@ pub enum ProxyMode {
         /// Target upstream (must include scheme and authority, e.g. `http://localhost:3000`).
         target: Uri,
     },
-    /// Transparent capture. The operating-system redirect should preserve the
-    /// original destination; `target` overrides it when that is not available.
-    Transparent { target: Option<Authority> },
     /// SOCKS5 listener with HTTP/HTTPS inspection and raw TCP fallback.
     Socks5,
     /// UDP DNS inspection/override mode.
@@ -363,17 +359,6 @@ impl Proxy {
                             let target = target.clone();
                             tokio::spawn(reverse::handle_connection(
                                 stream, remote_addr, handler, target, client,
-                            ));
-                        }
-                        ProxyMode::Transparent { target } => {
-                            tokio::spawn(forward::handle_transparent_connection(
-                                stream,
-                                remote_addr,
-                                handler,
-                                ca,
-                                client,
-                                self.config.addr,
-                                target.clone(),
                             ));
                         }
                         ProxyMode::Socks5 => {

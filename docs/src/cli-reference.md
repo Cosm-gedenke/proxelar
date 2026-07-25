@@ -10,10 +10,10 @@ proxelar addon <list|inspect|verify|install> [OPTIONS]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--interface` | `-i` | `tui` | Interface: `terminal`, `tui`, `gui`, or headless `api` |
-| `--mode` | `-m` | `forward` | Mode: `forward`, `reverse`, `transparent`, `wireguard`, `socks5`, `dns`, or `udp` |
+| `--mode` | `-m` | `forward` | Mode: `forward`, `reverse`, `wireguard`, `socks5`, `dns`, or `udp` |
 | `--port` | `-p` | `8080` | Port to listen on |
 | `--addr` | `-b` | `127.0.0.1` | Bind address |
-| `--target` | `-t` | — | Upstream URI for reverse, `HOST:PORT` for UDP, or fallback for transparent |
+| `--target` | `-t` | — | Upstream URI for reverse or `HOST:PORT` for UDP |
 | `--script` | `-s` | — | Lua script file or addon directory containing `init.lua` |
 | `--addon` | | — | Load a validated installed addon by name (conflicts with `--script`) |
 | `--addons-dir` | | `CA_DIR/addons` | Local addon catalog used by runtime and addon commands |
@@ -90,9 +90,6 @@ proxelar --upstream-proxy http://proxy.example:8080 \
 
 # SOCKS5 listener
 proxelar -m socks5 -p 1080
-
-# Transparent listener with an explicit destination fallback
-proxelar -m transparent --target api.example.test:443
 
 # DNS inspection with a local override
 proxelar -m dns -p 5353 --dns-map api.example.test=127.0.0.1

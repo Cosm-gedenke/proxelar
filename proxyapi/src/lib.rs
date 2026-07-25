@@ -1,7 +1,7 @@
 //! `proxyapi` — core library for the Proxelar MITM proxy.
 //!
-//! Provides HTTP/HTTPS, transparent, WireGuard, SOCKS5, DNS, and fixed-target
-//! UDP proxy functionality with request/response interception via [`HttpHandler`].
+//! Provides HTTP/HTTPS, WireGuard, SOCKS5, DNS, and fixed-target UDP proxy
+//! functionality with request/response interception via [`HttpHandler`].
 
 #![forbid(unsafe_code)]
 

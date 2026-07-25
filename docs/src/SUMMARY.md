@@ -21,7 +21,7 @@
 
 - [Forward Proxy](./proxy-modes/forward.md)
 - [Reverse Proxy](./proxy-modes/reverse.md)
-- [Transparent, WireGuard, SOCKS5, DNS, and raw UDP](./proxy-modes/transparent-socks-dns.md)
+- [WireGuard, SOCKS5, DNS, and raw UDP](./proxy-modes/wireguard-socks-dns.md)
 
 # Intercept
 

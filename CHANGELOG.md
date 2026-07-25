@@ -12,7 +12,7 @@
 - Show the generated WireGuard client profile as an importable QR code in the empty TUI and authenticated web GUI, and at terminal startup.
 - Add versioned native sessions, HAR import/export, curl and raw HTTP export, default secret redaction, and body truncation metadata.
 - Add shared boolean flow filters and decoded, content-aware body views across the TUI, web GUI, and REST API.
-- Add transparent, privilege-free WireGuard, SOCKS5, UDP DNS, and fixed-target raw UDP modes, raw TCP observation, and upstream HTTP CONNECT/SOCKS5 chaining.
+- Add privilege-free WireGuard, SOCKS5, UDP DNS, and fixed-target raw UDP modes, raw TCP observation, and upstream HTTP CONNECT/SOCKS5 chaining.
 - Add lossless structured Protobuf wire-field and MessagePack JSON editors in the TUI and web intercept flows.
 - Add declarative local/remote maps, redirects, mocks, and request-header rules.
 - Add a bearer-token headless API for sessions, filtering, content, replay, clearing traffic, and intercept decisions.

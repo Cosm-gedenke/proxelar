@@ -10,9 +10,9 @@ Choose another tool when you need end-to-end HTTP/2/HTTP/3 interception, a large
 
 ## mitmproxy
 
-mitmproxy is the category default for many developers and security testers. It has mature HTTP tooling, a large addon ecosystem, strong flow persistence/export workflows, transparent/local capture modes, and broad documentation.
+mitmproxy is the category default for many developers and security testers. It has mature HTTP tooling, a large addon ecosystem, strong flow persistence/export workflows, local capture modes, and broad documentation.
 
-Proxelar is smaller. Its strengths are a Rust-native implementation, one CLI with terminal/TUI/web/API interfaces, portable redacted exports, Lua/rule automation, and integrity-checked addon packages with a local catalog. It is not yet a mitmproxy replacement for protocol depth, transparent-capture onboarding, or the size of mitmproxy's community addon inventory.
+Proxelar is smaller. Its strengths are a Rust-native implementation, one CLI with terminal/TUI/web/API interfaces, portable redacted exports, Lua/rule automation, and integrity-checked addon packages with a local catalog. It is not yet a mitmproxy replacement for protocol depth or the size of mitmproxy's community addon inventory.
 
 Choose mitmproxy if you need the most mature general-purpose MITM proxy today. Choose Proxelar if you value a compact Rust-native tool with Lua transforms and are comfortable with a younger feature set.
 

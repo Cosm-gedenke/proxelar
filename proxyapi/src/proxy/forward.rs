@@ -141,8 +141,8 @@ pub async fn handle_connection(
 
         async move {
             // Direct request to the listener itself. Other origin-form
-            // requests are valid transparent/embedded-client traffic and are
-            // reconstructed from their Host field below.
+            // requests are valid embedded-client traffic and are reconstructed
+            // from their Host field below.
             if is_direct_cert_request(&req, listen_addr) {
                 let resp = cert_server::handle(&req, &ca.ca_cert_pem(), None);
                 return Ok::<_, hyper::Error>(resp);
@@ -202,62 +202,11 @@ fn is_direct_cert_request<B>(request: &Request<B>, listen_addr: SocketAddr) -> b
         })
 }
 
-/// Handle a connection redirected by a transparent-capture rule.
-///
-/// TPROXY-style setups preserve the original destination in `local_addr`.
-/// `target` provides an explicit destination for platforms or test setups
-/// where the redirect mechanism does not preserve it.
-pub async fn handle_transparent_connection(
-    stream: TcpStream,
-    remote_addr: SocketAddr,
-    handler: CapturingHandler,
-    ca: Arc<Ssl>,
-    client: Arc<Client>,
-    listen_addr: SocketAddr,
-    target: Option<Authority>,
-) {
-    let authority = match target {
-        Some(authority) => authority,
-        None => match stream.local_addr() {
-            Ok(destination) if destination != listen_addr => {
-                match destination.to_string().parse() {
-                    Ok(authority) => authority,
-                    Err(error) => {
-                        tracing::warn!("Transparent destination is invalid: {error}");
-                        return;
-                    }
-                }
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    "Transparent redirect did not preserve its original destination; use an explicit target or TPROXY"
-                );
-                return;
-            }
-            Err(error) => {
-                tracing::warn!("Could not resolve transparent destination: {error}");
-                return;
-            }
-        },
-    };
-
-    handle_transparent_stream(
-        stream,
-        remote_addr,
-        handler,
-        ca,
-        client,
-        listen_addr,
-        authority,
-    )
-    .await;
-}
-
 /// Inspect an already-established stream whose original destination is known.
 ///
-/// WireGuard and other userspace capture transports use this entry point so
-/// they share transparent mode's HTTP, TLS, and raw-stream behavior.
-pub(super) async fn handle_transparent_stream<I>(
+/// WireGuard and other userspace capture transports use this entry point to
+/// share HTTP, TLS, and raw-stream behavior.
+pub(super) async fn handle_captured_stream<I>(
     mut stream: I,
     remote_addr: SocketAddr,
     handler: CapturingHandler,
@@ -271,7 +220,7 @@ pub(super) async fn handle_transparent_stream<I>(
     let (protocol, buffered) = match sniff_stream_protocol(&mut stream).await {
         Ok(result) => result,
         Err(error) => {
-            tracing::debug!("Transparent protocol detection failed: {error}");
+            tracing::debug!("Captured-stream protocol detection failed: {error}");
             return;
         }
     };
@@ -289,21 +238,21 @@ pub(super) async fn handle_transparent_stream<I>(
             )
             .await
             {
-                tracing::debug!("Transparent HTTP connection failed: {error}");
+                tracing::debug!("Captured HTTP connection failed: {error}");
             }
         }
         StreamProtocol::Tls => {
             let server_config = match ca.gen_server_config(&authority).await {
                 Ok(config) => config,
                 Err(error) => {
-                    tracing::warn!("Transparent certificate generation failed: {error}");
+                    tracing::warn!("Captured-stream certificate generation failed: {error}");
                     return;
                 }
             };
             let stream = match TlsAcceptor::from(server_config).accept(stream).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    tracing::debug!("Transparent TLS handshake failed: {error}");
+                    tracing::debug!("Captured TLS handshake failed: {error}");
                     return;
                 }
             };
@@ -318,7 +267,7 @@ pub(super) async fn handle_transparent_stream<I>(
             )
             .await
             {
-                tracing::debug!("Transparent HTTPS connection failed: {error}");
+                tracing::debug!("Captured HTTPS connection failed: {error}");
             }
         }
         StreamProtocol::Unknown => {
@@ -326,7 +275,7 @@ pub(super) async fn handle_transparent_stream<I>(
             let mut upstream = match TcpStream::connect(authority.as_str()).await {
                 Ok(upstream) => upstream,
                 Err(error) => {
-                    tracing::debug!("Transparent TCP connection failed: {error}");
+                    tracing::debug!("Captured TCP connection failed: {error}");
                     return;
                 }
             };
@@ -338,7 +287,7 @@ pub(super) async fn handle_transparent_stream<I>(
             )
             .await
             {
-                tracing::debug!("Transparent TCP tunnel failed: {error}");
+                tracing::debug!("Captured TCP tunnel failed: {error}");
             }
         }
     }

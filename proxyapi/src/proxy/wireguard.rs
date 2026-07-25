@@ -441,7 +441,7 @@ async fn tcp_loop(
                     .to_string()
                     .parse::<Authority>()
                     .map_err(|_| invalid_input("invalid WireGuard TCP destination"))?;
-                tokio::spawn(forward::handle_transparent_stream(
+                tokio::spawn(forward::handle_captured_stream(
                     stream,
                     source,
                     handler.clone(),

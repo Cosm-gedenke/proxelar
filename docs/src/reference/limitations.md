@@ -14,7 +14,7 @@ When an intercepted body changes, Proxelar removes stale transfer/content encodi
 
 ## Capture modes
 
-Proxelar supports forward, reverse, transparent, WireGuard, SOCKS5, DNS, and fixed-target UDP modes plus upstream HTTP CONNECT/SOCKS5 chaining. Transparent capture depends on the operating system preserving the original destination (for example Linux TPROXY); otherwise supply `--target HOST:PORT`. WireGuard capture uses a userspace TCP/IP stack and currently generates one client identity per CA directory. Proxelar does not install firewall rules or modify system proxy settings.
+Proxelar supports forward, reverse, WireGuard, SOCKS5, DNS, and fixed-target UDP modes plus upstream HTTP CONNECT/SOCKS5 chaining. WireGuard capture uses a userspace TCP/IP stack and currently generates one client identity per CA directory. Proxelar does not install firewall rules or modify system proxy settings.
 
 Unknown TCP streams can be observed as directional chunks, but there is no protocol-aware binary editor.
 

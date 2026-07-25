@@ -1,18 +1,4 @@
-# Transparent, WireGuard, SOCKS5, DNS, and raw UDP modes
-
-## Transparent capture
-
-```bash
-proxelar -m transparent -b 0.0.0.0 -p 8080
-```
-
-Transparent mode inspects HTTP and TLS when the operating-system redirect preserves the original destination. On Linux this normally means TPROXY/policy-routing setup outside Proxelar. If destination recovery is unavailable, provide a fixed fallback:
-
-```bash
-proxelar -m transparent --target api.example.test:443
-```
-
-Unknown protocols are forwarded as raw TCP and recorded as bounded directional chunks. Proxelar deliberately does not install or remove firewall rules.
+# WireGuard, SOCKS5, DNS, and raw UDP modes
 
 ## WireGuard capture
 
@@ -67,4 +53,4 @@ UDP mode forwards each client datagram to one configured upstream and captures b
 proxelar --mode udp --port 9001 --target upstream.example:9000
 ```
 
-This is useful for testing a known datagram service. It is intentionally not a transparent arbitrary-destination router: each invocation has one target, receives at most one response per request, and reports `no-response` after five seconds.
+This is useful for testing a known datagram service. It is intentionally not an arbitrary-destination router: each invocation has one target, receives at most one response per request, and reports `no-response` after five seconds.

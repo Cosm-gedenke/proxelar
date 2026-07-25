@@ -89,14 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ProxyMode::Reverse { target }
         }
-        Mode::Transparent => {
-            let target = args
-                .target
-                .as_deref()
-                .map(str::parse::<http::uri::Authority>)
-                .transpose()?;
-            ProxyMode::Transparent { target }
-        }
         Mode::Socks5 => ProxyMode::Socks5,
         Mode::Dns => {
             let mut config = DnsConfig::new(resolve_socket_addr(&args.dns_upstream).await?);

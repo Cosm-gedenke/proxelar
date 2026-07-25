@@ -33,7 +33,7 @@ pub struct Args {
     #[arg(short = 'b', long, default_value = "127.0.0.1")]
     pub addr: IpAddr,
 
-    /// Target upstream (required for reverse and UDP; optional HOST:PORT for transparent)
+    /// Target upstream (required for reverse and UDP)
     #[arg(
         short,
         long,
@@ -249,7 +249,6 @@ pub enum Interface {
 pub enum Mode {
     Forward,
     Reverse,
-    Transparent,
     Socks5,
     Dns,
     Udp,

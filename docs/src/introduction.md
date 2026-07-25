@@ -10,7 +10,7 @@ It is aimed at development and debugging workflows: API inspection, local servic
 - **Intercept HTTPS** — automatic CA certificate generation and per-host certificate minting
 - **Modify traffic with scripts and rules** — hot-reload Lua hooks or declare maps, redirects, mocks, and header changes
 - **Package repeatable extensions** — verify, install, discover, and run versioned integrity-checked Lua addons
-- **Seven capture modes** — forward, reverse, transparent, WireGuard, SOCKS5, DNS, and fixed-target UDP
+- **Six capture modes** — forward, reverse, WireGuard, SOCKS5, DNS, and fixed-target UDP
 - **Four interfaces** — interactive TUI, plain terminal output, web GUI, or headless REST API
 - **Inspect WebSockets** — capture WebSocket connections and browse individual frames
 - **Keep portable sessions** — reload native captures or exchange HAR, curl, and raw HTTP artifacts with default secret redaction
