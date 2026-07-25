@@ -97,12 +97,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          config: cliff.toml
-          args: --latest --strip header
+      - name: Read release notes from changelog
+        id: release-notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(
+            awk -v heading="## [$version]" '
+              index($0, heading) == 1 { in_release = 1; next }
+              in_release && /^## \[/ { exit }
+              in_release { print }
+            ' CHANGELOG.md
+          )"
+          if [[ -z "${notes//[[:space:]]/}" ]]; then
+            echo "No CHANGELOG.md section found for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          {
+            echo "content<<RELEASE_NOTES"
+            printf '%s\n' "$notes"
+            echo "RELEASE_NOTES"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v8
         with:
@@ -130,7 +145,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          body: ${{ steps.changelog.outputs.content }}
+          body: ${{ steps.release-notes.outputs.content }}
           files: artifacts/*
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:

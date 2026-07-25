@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-25
+
 ### Added
 
 - Show the generated WireGuard client profile as an importable QR code in the empty TUI and authenticated web GUI, and at terminal startup.
