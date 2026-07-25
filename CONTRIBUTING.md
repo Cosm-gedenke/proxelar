@@ -91,7 +91,7 @@ cargo llvm-cov --workspace --all-features --locked \
   --ignore-filename-regex '(^|/)(tests|target)/' \
   --fail-under-lines 80
 
-cargo llvm-cov -p proxyapi --all-features --locked \
+cargo llvm-cov report -p proxyapi \
   --ignore-filename-regex '(^|/)(tests|target)/' \
   --fail-under-lines 90
 ```
@@ -99,6 +99,8 @@ cargo llvm-cov -p proxyapi --all-features --locked \
 CI additionally verifies package tarball construction with `cargo package --workspace --locked --no-verify`, Rust documentation with warnings denied, dependency audits, coverage, and the matrix on Linux, macOS, and Windows.
 
 ## Project Structure
+
+The [architecture guide](docs/src/contributing/architecture.md) traces the listener, handler, event, session, and interface boundaries in more detail.
 
 The workspace has three crates with a strict dependency direction: `proxelar-cli` → `proxyapi` → `proxyapi_models`.
 

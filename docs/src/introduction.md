@@ -8,20 +8,22 @@ It is aimed at development and debugging workflows: API inspection, local servic
 
 - **Inspect traffic** — see every request and response in real time, including headers and bodies
 - **Intercept HTTPS** — automatic CA certificate generation and per-host certificate minting
-- **Modify traffic with Lua scripts** — write `on_request` and `on_response` hooks to transform, block, or mock traffic at runtime
-- **Forward and reverse proxy** — use as a system proxy (forward) or put it in front of your service (reverse)
-- **Three interfaces** — interactive TUI, plain terminal output, or web GUI
+- **Modify traffic with scripts and rules** — hot-reload Lua hooks or declare maps, redirects, mocks, and header changes
+- **Package repeatable extensions** — verify, install, discover, and run versioned integrity-checked Lua addons
+- **Six capture modes** — forward, reverse, WireGuard, SOCKS5, DNS, and fixed-target UDP
+- **Four interfaces** — interactive TUI, plain terminal output, web GUI, or headless REST API
 - **Inspect WebSockets** — capture WebSocket connections and browse individual frames
+- **Keep portable sessions** — reload native captures or exchange HAR, curl, and raw HTTP artifacts with default secret redaction
 
 ## What is it not?
 
-Proxelar is not trying to replace a mature security suite. If you need scanning, collaborative testing, a large addon ecosystem, or advanced transparent capture today, use a tool built for that workflow. Proxelar is deliberately smaller: a local, scriptable proxy that is easy to install, run, and automate.
+Proxelar is not trying to replace a mature security suite. If you need scanning, collaborative testing, a large pre-existing addon inventory, or end-to-end HTTP/2/HTTP/3 interception, use a tool built for that workflow. Proxelar is deliberately smaller: a local, scriptable proxy that is easy to install, run, and automate.
 
 ## Architecture
 
 Proxelar is built as a three-crate Rust workspace:
 
-- **`proxelar-cli`** — the CLI binary with three interface modes
+- **`proxelar-cli`** — the CLI binary with terminal, TUI, web, and API interfaces
 - **`proxyapi`** — the core proxy engine, usable as a standalone library
 - **`proxyapi_models`** — shared request/response data types
 

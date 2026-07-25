@@ -9,7 +9,7 @@ use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
@@ -29,18 +29,8 @@ use super::{
 
 /// HTTP/2 prior-knowledge connection preface.
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-/// HTTP/1 request method prefixes used for CONNECT tunnel protocol sniffing.
-const HTTP1_METHOD_PREFIXES: &[&[u8]] = &[
-    b"CONNECT ",
-    b"DELETE ",
-    b"GET ",
-    b"HEAD ",
-    b"OPTIONS ",
-    b"PATCH ",
-    b"POST ",
-    b"PUT ",
-    b"TRACE ",
-];
+/// Maximum request prefix inspected while deciding whether a stream is HTTP/1.
+const MAX_PROTOCOL_PREFIX: usize = 4096;
 /// TLS record content type: Handshake.
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 /// TLS major version byte (SSLv3 / TLS 1.x).
@@ -49,7 +39,7 @@ const TLS_VERSION_MAJOR: u8 = 0x03;
 const MAX_WS_FRAME_PAYLOAD: Option<usize> = crate::handler::DEFAULT_BODY_CAPTURE_LIMIT;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum StreamProtocol {
+pub(super) enum StreamProtocol {
     Http,
     Tls,
     Unknown,
@@ -60,6 +50,63 @@ enum TunnelRequestError {
     MissingHost,
     InvalidHost,
     InvalidUri,
+}
+
+#[derive(Clone)]
+enum UpstreamClient {
+    Shared(Arc<Client>),
+    Pinned(Arc<Mutex<hyper::client::conn::http1::SendRequest<ProxyBody>>>),
+}
+
+impl UpstreamClient {
+    async fn pinned<I>(stream: I) -> Result<Self, BoxError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .handshake(TokioIo::new(stream))
+            .await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                tracing::debug!("Pinned upstream HTTP connection closed: {error}");
+            }
+        });
+        Ok(Self::Pinned(Arc::new(Mutex::new(sender))))
+    }
+
+    async fn request(
+        &self,
+        mut request: Request<ProxyBody>,
+    ) -> Result<Response<hyper::body::Incoming>, BoxError> {
+        match self {
+            Self::Shared(client) => client.request(request).await.map_err(Into::into),
+            Self::Pinned(sender) => {
+                use http::header::HOST;
+
+                let authority = request.uri().authority().cloned().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pinned upstream request is missing an authority",
+                    )
+                })?;
+                request
+                    .headers_mut()
+                    .insert(HOST, authority.as_str().parse()?);
+                let path_and_query: http::uri::PathAndQuery = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", http::uri::PathAndQuery::as_str)
+                    .parse()?;
+                *request.uri_mut() = Uri::builder().path_and_query(path_and_query).build()?;
+
+                let mut sender = sender.lock().await;
+                sender.ready().await?;
+                sender.send_request(request).await.map_err(Into::into)
+            }
+        }
+    }
 }
 
 /// Returns true when the request carries WebSocket upgrade tokens.
@@ -93,9 +140,10 @@ pub async fn handle_connection(
         let client = Arc::clone(&client);
 
         async move {
-            // Direct request to the proxy itself (relative URI, no host).
-            // Serves the cert download page at http://localhost:PORT/
-            if req.uri().host().is_none() && !req.uri().path().is_empty() {
+            // Direct request to the listener itself. Other origin-form
+            // requests are valid embedded-client traffic and are reconstructed
+            // from their Host field below.
+            if is_direct_cert_request(&req, listen_addr) {
                 let resp = cert_server::handle(&req, &ca.ca_cert_pem(), None);
                 return Ok::<_, hyper::Error>(resp);
             }
@@ -110,6 +158,10 @@ pub async fn handle_connection(
                 return process_connect(req, handler, ca, client, remote_addr, listen_addr);
             }
 
+            let req = match reconstruct_tunnel_uri(req, Scheme::HTTP) {
+                Ok(req) => req,
+                Err(error) => return Ok(error.into_response()),
+            };
             forward_http_request(req, handler, client, remote_addr).await
         }
     });
@@ -117,6 +169,126 @@ pub async fn handle_connection(
     if let Err(e) = serve_auto_connection(io, service).await {
         if !is_benign_shutdown_error(e.as_ref()) {
             tracing::debug!("Connection error: {e}");
+        }
+    }
+}
+
+fn is_direct_cert_request<B>(request: &Request<B>, listen_addr: SocketAddr) -> bool {
+    if request.uri().host().is_some() || request.uri().path().is_empty() {
+        return false;
+    }
+    let Some(host) = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let Ok(authority) = host.parse::<Authority>() else {
+        return false;
+    };
+    if authority.port_u16().unwrap_or(80) != listen_addr.port() {
+        return false;
+    }
+    if authority.host().eq_ignore_ascii_case("localhost") {
+        return listen_addr.ip().is_loopback() || listen_addr.ip().is_unspecified();
+    }
+    authority
+        .host()
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|host_ip| {
+            host_ip == listen_addr.ip()
+                || (listen_addr.ip().is_unspecified() && host_ip.is_loopback())
+        })
+}
+
+/// Inspect an already-established stream whose original destination is known.
+///
+/// WireGuard and other userspace capture transports use this entry point to
+/// share HTTP, TLS, and raw-stream behavior.
+pub(super) async fn handle_captured_stream<I>(
+    mut stream: I,
+    remote_addr: SocketAddr,
+    handler: CapturingHandler,
+    ca: Arc<Ssl>,
+    client: Arc<Client>,
+    listen_addr: SocketAddr,
+    authority: Authority,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (protocol, buffered) = match sniff_stream_protocol(&mut stream).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::debug!("Captured-stream protocol detection failed: {error}");
+            return;
+        }
+    };
+    let stream = Rewind::new_buffered(stream, buffered);
+    match protocol {
+        StreamProtocol::Http => {
+            if let Err(error) = serve_stream(
+                stream,
+                Scheme::HTTP,
+                handler,
+                ca,
+                client,
+                remote_addr,
+                listen_addr,
+            )
+            .await
+            {
+                tracing::debug!("Captured HTTP connection failed: {error}");
+            }
+        }
+        StreamProtocol::Tls => {
+            let server_config = match ca.gen_server_config(&authority).await {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!("Captured-stream certificate generation failed: {error}");
+                    return;
+                }
+            };
+            let stream = match TlsAcceptor::from(server_config).accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!("Captured TLS handshake failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = serve_stream(
+                stream,
+                Scheme::HTTPS,
+                handler,
+                ca,
+                client,
+                remote_addr,
+                listen_addr,
+            )
+            .await
+            {
+                tracing::debug!("Captured HTTPS connection failed: {error}");
+            }
+        }
+        StreamProtocol::Unknown => {
+            let mut stream = stream;
+            let mut upstream = match TcpStream::connect(authority.as_str()).await {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    tracing::debug!("Captured TCP connection failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = super::raw::tunnel(
+                &mut stream,
+                &mut upstream,
+                authority.to_string(),
+                handler.event_tx_clone(),
+            )
+            .await
+            {
+                tracing::debug!("Captured TCP tunnel failed: {error}");
+            }
         }
     }
 }
@@ -224,8 +396,13 @@ fn process_connect(
                         };
 
                         let mut upgraded = upgraded;
-                        if let Err(e) =
-                            tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                        if let Err(e) = super::raw::tunnel(
+                            &mut upgraded,
+                            &mut server,
+                            authority.to_string(),
+                            handler.event_tx_clone(),
+                        )
+                        .await
                         {
                             tracing::debug!(
                                 "Failed to tunnel unknown protocol to {authority_str}: {e}"
@@ -245,7 +422,7 @@ fn process_connect(
 ///
 /// Each request is passed through the [`CapturingHandler`] for inspection before
 /// being forwarded to the upstream server via `client`.
-async fn serve_stream<I>(
+pub(super) async fn serve_stream<I>(
     stream: I,
     scheme: Scheme,
     handler: CapturingHandler,
@@ -257,12 +434,65 @@ async fn serve_stream<I>(
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_stream_with_upstream(
+        stream,
+        scheme,
+        handler,
+        ca,
+        UpstreamClient::Shared(client),
+        remote_addr,
+        listen_addr,
+    )
+    .await
+}
+
+/// Serve inspected client traffic over one already-established upstream
+/// connection. SOCKS5 uses this to preserve the destination selected by its
+/// CONNECT request even when the inner HTTP `Host` value differs.
+pub(super) async fn serve_pinned_stream<I, U>(
+    stream: I,
+    upstream: U,
+    scheme: Scheme,
+    handler: CapturingHandler,
+    ca: Arc<Ssl>,
+    remote_addr: SocketAddr,
+    listen_addr: SocketAddr,
+) -> Result<(), BoxError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let upstream = UpstreamClient::pinned(upstream).await?;
+    serve_stream_with_upstream(
+        stream,
+        scheme,
+        handler,
+        ca,
+        upstream,
+        remote_addr,
+        listen_addr,
+    )
+    .await
+}
+
+async fn serve_stream_with_upstream<I>(
+    stream: I,
+    scheme: Scheme,
+    handler: CapturingHandler,
+    ca: Arc<Ssl>,
+    upstream: UpstreamClient,
+    remote_addr: SocketAddr,
+    listen_addr: SocketAddr,
+) -> Result<(), BoxError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = TokioIo::new(stream);
 
     let service = service_fn(move |mut req: Request<hyper::body::Incoming>| {
         let handler = handler.clone();
         let ca = Arc::clone(&ca);
-        let client = Arc::clone(&client);
+        let upstream = upstream.clone();
         let scheme = scheme.clone();
 
         async move {
@@ -277,7 +507,7 @@ where
                 return Ok::<_, hyper::Error>(resp);
             }
 
-            forward_http_request(req, handler, client, remote_addr).await
+            forward_http_request_with(req, handler, upstream, remote_addr).await
         }
     });
 
@@ -285,9 +515,18 @@ where
 }
 
 async fn forward_http_request(
+    req: Request<hyper::body::Incoming>,
+    handler: CapturingHandler,
+    client: Arc<Client>,
+    remote_addr: SocketAddr,
+) -> Result<Response<ProxyBody>, hyper::Error> {
+    forward_http_request_with(req, handler, UpstreamClient::Shared(client), remote_addr).await
+}
+
+async fn forward_http_request_with(
     mut req: Request<hyper::body::Incoming>,
     mut handler: CapturingHandler,
-    client: Arc<Client>,
+    upstream: UpstreamClient,
     remote_addr: SocketAddr,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let client_version = req.version();
@@ -315,7 +554,7 @@ async fn forward_http_request(
         prepare_upstream_request(req)
     };
 
-    match client.request(upstream_req).await {
+    match upstream.request(upstream_req).await {
         Ok(res) => {
             if is_ws && res.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
                 return Ok(upgrade_websocket_response(res, handler, client_on_upgrade));
@@ -367,8 +606,18 @@ fn upgrade_websocket_response(
 
     if let Some(client_fut) = client_on_upgrade {
         let event_tx = handler.event_tx_clone();
+        #[cfg(feature = "scripting")]
+        let script_engine = handler.script_engine_clone();
         tokio::spawn(async move {
-            pump_websocket_frames(conn_id, client_fut, server_on_upgrade, event_tx).await;
+            pump_websocket_frames(
+                conn_id,
+                client_fut,
+                server_on_upgrade,
+                event_tx,
+                #[cfg(feature = "scripting")]
+                script_engine,
+            )
+            .await;
         });
     }
 
@@ -426,11 +675,13 @@ impl TunnelRequestError {
     }
 }
 
-async fn sniff_stream_protocol<I>(stream: &mut I) -> std::io::Result<(StreamProtocol, Bytes)>
+pub(super) async fn sniff_stream_protocol<I>(
+    stream: &mut I,
+) -> std::io::Result<(StreamProtocol, Bytes)>
 where
     I: AsyncRead + Unpin,
 {
-    let mut buffer = [0u8; H2_PREFACE.len()];
+    let mut buffer = [0u8; MAX_PROTOCOL_PREFIX];
     let mut filled = 0;
 
     loop {
@@ -480,17 +731,50 @@ fn is_h2_preface(buffered: &[u8]) -> bool {
 }
 
 fn is_http1_request(buffered: &[u8]) -> bool {
-    HTTP1_METHOD_PREFIXES
+    let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    let Some(version_start) = buffered[method_end + 1..]
         .iter()
-        .any(|method| buffered.starts_with(method))
+        .position(|byte| *byte == b' ')
+        .map(|offset| method_end + 1 + offset + 1)
+    else {
+        return false;
+    };
+    method_end > 0
+        && buffered[..method_end]
+            .iter()
+            .all(|byte| is_http_token(*byte))
+        && version_start + 8 <= buffered.len()
+        && buffered[version_start..].starts_with(b"HTTP/1.")
 }
 
 fn could_be_known_protocol(buffered: &[u8]) -> bool {
     is_partial_tls_handshake(buffered)
         || H2_PREFACE.starts_with(buffered)
-        || HTTP1_METHOD_PREFIXES
+        || could_be_http1_request(buffered)
+}
+
+fn could_be_http1_request(buffered: &[u8]) -> bool {
+    let Some(method_end) = buffered.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    if method_end == 0
+        || !buffered[..method_end]
             .iter()
-            .any(|method| method.starts_with(buffered))
+            .all(|byte| is_http_token(*byte))
+    {
+        return false;
+    }
+    buffered[method_end + 1..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .is_none()
+        || is_http1_request(buffered)
+}
+
+fn is_http_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 fn is_partial_tls_handshake(buffered: &[u8]) -> bool {
@@ -508,6 +792,7 @@ async fn pump_websocket_frames(
     client_on_upgrade: hyper::upgrade::OnUpgrade,
     server_on_upgrade: hyper::upgrade::OnUpgrade,
     event_tx: mpsc::Sender<ProxyEvent>,
+    #[cfg(feature = "scripting")] script_engine: Option<Arc<crate::scripting::ScriptEngine>>,
 ) {
     let (client_upgraded, server_upgraded) =
         match tokio::try_join!(client_on_upgrade, server_on_upgrade) {
@@ -537,6 +822,12 @@ async fn pump_websocket_frames(
         tokio::select! {
             msg = client_ws.next() => match msg {
                 Some(Ok(frame)) => {
+                    #[cfg(feature = "scripting")]
+                    let Some(frame) = transform_ws_frame(
+                        frame,
+                        WsDirection::ClientToServer,
+                        script_engine.as_deref(),
+                    ) else { continue; };
                     emit_ws_frame(&event_tx, conn_id, &frame, WsDirection::ClientToServer);
                     if server_ws.send(frame).await.is_err() { break; }
                 }
@@ -548,6 +839,12 @@ async fn pump_websocket_frames(
             },
             msg = server_ws.next() => match msg {
                 Some(Ok(frame)) => {
+                    #[cfg(feature = "scripting")]
+                    let Some(frame) = transform_ws_frame(
+                        frame,
+                        WsDirection::ServerToClient,
+                        script_engine.as_deref(),
+                    ) else { continue; };
                     emit_ws_frame(&event_tx, conn_id, &frame, WsDirection::ServerToClient);
                     if client_ws.send(frame).await.is_err() { break; }
                 }
@@ -561,6 +858,48 @@ async fn pump_websocket_frames(
     }
 
     let _ = event_tx.try_send(ProxyEvent::WebSocketClosed { conn_id });
+}
+
+#[cfg(feature = "scripting")]
+fn transform_ws_frame(
+    frame: Message,
+    direction: WsDirection,
+    engine: Option<&crate::scripting::ScriptEngine>,
+) -> Option<Message> {
+    let Some(engine) = engine else {
+        return Some(frame);
+    };
+    let direction_name = match direction {
+        WsDirection::ClientToServer => "client_to_server",
+        WsDirection::ServerToClient => "server_to_client",
+    };
+    let (opcode, payload): (&str, &[u8]) = match &frame {
+        Message::Text(payload) => ("text", payload.as_bytes()),
+        Message::Binary(payload) => ("binary", payload.as_ref()),
+        Message::Ping(payload) => ("ping", payload.as_ref()),
+        Message::Pong(payload) => ("pong", payload.as_ref()),
+        Message::Close(_) | Message::Frame(_) => return Some(frame),
+    };
+    match engine.on_websocket_frame(direction_name, opcode, payload) {
+        Ok(crate::scripting::ScriptWebSocketAction::PassThrough) => Some(frame),
+        Ok(crate::scripting::ScriptWebSocketAction::Drop) => None,
+        Ok(crate::scripting::ScriptWebSocketAction::Forward(payload)) => match frame {
+            Message::Text(_) => String::from_utf8(payload.to_vec())
+                .map(|payload| Message::Text(payload.into()))
+                .map_err(|error| {
+                    tracing::warn!("Lua WebSocket text replacement was not UTF-8: {error}");
+                })
+                .ok(),
+            Message::Binary(_) => Some(Message::Binary(payload)),
+            Message::Ping(_) => Some(Message::Ping(payload)),
+            Message::Pong(_) => Some(Message::Pong(payload)),
+            other @ (Message::Close(_) | Message::Frame(_)) => Some(other),
+        },
+        Err(error) => {
+            tracing::warn!("Lua on_websocket_frame error (passing through): {error}");
+            Some(frame)
+        }
+    }
 }
 
 /// Convert a tungstenite [`Message`] into a [`WsFrame`] event and send it.
@@ -684,6 +1023,10 @@ mod tests {
             StreamProtocol::Http
         );
         assert_eq!(
+            classify_buffered_protocol(b"PROPFIND /collection HTTP/1.1\r\n"),
+            StreamProtocol::Http
+        );
+        assert_eq!(
             classify_buffered_protocol(&[TLS_RECORD_HANDSHAKE, TLS_VERSION_MAJOR, 0x03, 0x00]),
             StreamProtocol::Tls
         );
@@ -696,9 +1039,11 @@ mod tests {
     #[test]
     fn could_be_known_protocol_waits_for_partial_prefixes() {
         assert!(could_be_known_protocol(b"P"));
+        assert!(!could_be_known_protocol(b"CUSTOM"));
+        assert!(could_be_known_protocol(b"CUSTOM /path"));
         assert!(could_be_known_protocol(b"PRI * HTTP/2.0\r\n"));
         assert!(could_be_known_protocol(&[TLS_RECORD_HANDSHAKE]));
-        assert!(!could_be_known_protocol(b"NOPE"));
+        assert!(!could_be_known_protocol(b"\x01NOPE"));
     }
 
     #[tokio::test]

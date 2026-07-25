@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "header-tagger",
+  "version": "1.0.0",
+  "description": "Adds a diagnostic header to every proxied request.",
+  "entrypoint": "init.lua",
+  "authors": ["Proxelar contributors"],
+  "license": "MIT",
+  "hooks": ["request"],
+  "requires_native_modules": false,
+  "files": {
+    "init.lua": "48b7e686fb9994da483ad1ff831c189f2c455a5431649356fb4ca264e4ad075a"
+  }
+}

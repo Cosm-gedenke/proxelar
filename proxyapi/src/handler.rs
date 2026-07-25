@@ -3,7 +3,7 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper::body::Body as HttpBody;
 use hyper::{Request, Response};
-use proxyapi_models::{ProxiedRequest, ProxiedResponse};
+use proxyapi_models::{BodyMetadata, ProxiedRequest, ProxiedResponse};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
 
@@ -44,6 +44,16 @@ impl RequestBody {
         }
 
         *self = Self::Buffered(modified_body);
+    }
+
+    fn metadata(&self) -> BodyMetadata {
+        match self {
+            Self::Buffered(bytes) => BodyMetadata::complete(bytes.len()),
+            Self::Streaming { captured, .. } => BodyMetadata {
+                truncated: true,
+                total_seen: captured.len(),
+            },
+        }
     }
 }
 
@@ -101,7 +111,18 @@ impl CapturedRequest {
             } => {
                 let snapshot = body.snapshot();
                 log_truncated_capture("request", &snapshot);
-                ProxiedRequest::new(method, uri, version, headers, snapshot.bytes, time)
+                ProxiedRequest::new_with_body_metadata(
+                    method,
+                    uri,
+                    version,
+                    headers,
+                    snapshot.bytes,
+                    BodyMetadata {
+                        truncated: snapshot.truncated,
+                        total_seen: snapshot.total_seen,
+                    },
+                    time,
+                )
             }
         }
     }
@@ -121,7 +142,18 @@ impl CapturedRequest {
                 done.notified().await;
                 let snapshot = body.snapshot();
                 log_truncated_capture("request", &snapshot);
-                ProxiedRequest::new(method, uri, version, headers, snapshot.bytes, time)
+                ProxiedRequest::new_with_body_metadata(
+                    method,
+                    uri,
+                    version,
+                    headers,
+                    snapshot.bytes,
+                    BodyMetadata {
+                        truncated: snapshot.truncated,
+                        total_seen: snapshot.total_seen,
+                    },
+                    time,
+                )
             }
         }
     }
@@ -145,6 +177,17 @@ fn log_truncated_capture(kind: &str, snapshot: &BodySnapshot) {
             snapshot.bytes.len(),
             snapshot.total_seen
         );
+    }
+}
+
+fn reconcile_edited_body_headers(headers: &mut http::HeaderMap, body: &Bytes) {
+    headers.remove(http::header::TRANSFER_ENCODING);
+    headers.remove(http::header::CONTENT_ENCODING);
+    match http::HeaderValue::try_from(body.len().to_string()) {
+        Ok(length) => {
+            headers.insert(http::header::CONTENT_LENGTH, length);
+        }
+        Err(error) => tracing::warn!("Could not update Content-Length after body edit: {error}"),
     }
 }
 
@@ -280,6 +323,7 @@ pub struct CapturingHandler {
     pending_id: Option<u64>,
     intercept: Option<Arc<InterceptConfig>>,
     body_capture_limit: Option<usize>,
+    route_rules: Option<Arc<crate::rules::RouteRules>>,
     #[cfg(feature = "scripting")]
     script_engine: Option<Arc<crate::scripting::ScriptEngine>>,
 }
@@ -305,6 +349,7 @@ impl CapturingHandler {
             pending_id: None,
             intercept: None,
             body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
+            route_rules: None,
             #[cfg(feature = "scripting")]
             script_engine: None,
         }
@@ -324,6 +369,13 @@ impl CapturingHandler {
     #[must_use]
     pub fn with_intercept(mut self, cfg: Arc<InterceptConfig>) -> Self {
         self.intercept = Some(cfg);
+        self
+    }
+
+    /// Attach declarative request routing rules.
+    #[must_use]
+    pub fn with_route_rules(mut self, rules: Arc<crate::rules::RouteRules>) -> Self {
+        self.route_rules = Some(rules);
         self
     }
 
@@ -375,6 +427,11 @@ impl CapturingHandler {
     /// Clone the event sender for use in long-lived spawned tasks (e.g. WS frame pump).
     pub(crate) fn event_tx_clone(&self) -> mpsc::Sender<ProxyEvent> {
         self.event_tx.clone()
+    }
+
+    #[cfg(feature = "scripting")]
+    pub(crate) fn script_engine_clone(&self) -> Option<Arc<crate::scripting::ScriptEngine>> {
+        self.script_engine.clone()
     }
 
     /// Run intercept logic for a replayed request and return it ready to forward.
@@ -438,6 +495,9 @@ impl CapturingHandler {
                                 uri = u;
                             }
                             headers = h;
+                            if b != body_bytes {
+                                reconcile_edited_body_headers(&mut headers, &b);
+                            }
                             body_bytes = b;
                             self.captured_request =
                                 Some(CapturedRequest::buffered(ProxiedRequest::new(
@@ -592,11 +652,15 @@ impl CapturingHandler {
 
             let response_snapshot = response_capture_for_body.snapshot();
             log_truncated_capture("response", &response_snapshot);
-            let response = ProxiedResponse::new(
+            let response = ProxiedResponse::new_with_body_metadata(
                 status,
                 version,
                 headers,
                 response_snapshot.bytes,
+                BodyMetadata {
+                    truncated: response_snapshot.truncated,
+                    total_seen: response_snapshot.total_seen,
+                },
                 now_millis(),
             );
 
@@ -747,15 +811,19 @@ impl CapturingHandler {
                 Request::from_parts(parts, body::full(body_bytes))
             }
             RequestBody::Streaming { captured, body } => {
-                self.captured_request = Some(CapturedRequest::buffered(ProxiedRequest::new(
-                    parts.method.clone(),
-                    parts.uri.clone(),
-                    parts.version,
-                    parts.headers.clone(),
-                    captured,
+                let capture = BodyCapture::new(self.body_capture_limit);
+                let done = Arc::new(Notify::new());
+                self.captured_request = Some(CapturedRequest::streaming(
+                    &parts,
+                    capture.clone(),
+                    Arc::clone(&done),
                     now_millis(),
-                )));
-                Request::from_parts(parts, body)
+                ));
+                debug_assert!(captured.len() <= self.body_capture_limit.unwrap_or(usize::MAX));
+                Request::from_parts(
+                    parts,
+                    body::capture(body, capture, move || done.notify_one()),
+                )
             }
         }
     }
@@ -774,6 +842,51 @@ impl HttpHandler for CapturingHandler {
         self.pending_id = Some(id);
 
         let (mut parts, incoming) = req.into_parts();
+        if let Some(rules) = &self.route_rules {
+            match rules
+                .apply(&parts.method, &mut parts.uri, &mut parts.headers)
+                .await
+            {
+                Ok(crate::rules::RuleOutcome::Forward) => {}
+                Ok(crate::rules::RuleOutcome::Respond {
+                    status,
+                    headers,
+                    body,
+                }) => {
+                    let (captured, metadata) =
+                        match collect_body(incoming, self.body_capture_limit, "request").await {
+                            BodyCollection::Complete(bytes) => {
+                                let metadata = BodyMetadata::complete(bytes.len());
+                                (bytes, metadata)
+                            }
+                            BodyCollection::Exceeded { captured, .. } => {
+                                let metadata = BodyMetadata {
+                                    truncated: true,
+                                    total_seen: captured.len(),
+                                };
+                                (captured, metadata)
+                            }
+                        };
+                    self.captured_request = Some(CapturedRequest::buffered(
+                        ProxiedRequest::new_with_body_metadata(
+                            parts.method,
+                            parts.uri,
+                            parts.version,
+                            parts.headers,
+                            captured,
+                            metadata,
+                            now_millis(),
+                        ),
+                    ));
+                    return RequestOrResponse::Response(
+                        self.synthetic_response(status, headers, body),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!("Route rule error (passing through): {error}");
+                }
+            }
+        }
         if !self.should_buffer_request() {
             let capture = BodyCapture::new(self.body_capture_limit);
             let done = Arc::new(Notify::new());
@@ -841,6 +954,9 @@ impl HttpHandler for CapturingHandler {
                     } else {
                         body
                     };
+                    if decoded.is_none() && wire != raw {
+                        reconcile_edited_body_headers(&mut parts.headers, &wire);
+                    }
                     request_body.apply_modified_body(&raw, wire);
                 }
                 Ok(crate::scripting::ScriptRequestAction::ShortCircuit {
@@ -849,12 +965,13 @@ impl HttpHandler for CapturingHandler {
                     body,
                 }) => {
                     // Capture the original request before short-circuiting
-                    let proxied_request = ProxiedRequest::new(
+                    let proxied_request = ProxiedRequest::new_with_body_metadata(
                         parts.method.clone(),
                         parts.uri.clone(),
                         parts.version,
                         parts.headers.clone(),
                         request_body.hook_bytes().clone(),
+                        request_body.metadata(),
                         now_millis(),
                     );
                     self.captured_request = Some(CapturedRequest::buffered(proxied_request));
@@ -877,12 +994,13 @@ impl HttpHandler for CapturingHandler {
         // Intercept mode: pause the request and wait for a UI decision.
         if let Some(ref cfg) = self.intercept {
             if cfg.is_enabled() {
-                let snapshot = ProxiedRequest::new(
+                let snapshot = ProxiedRequest::new_with_body_metadata(
                     parts.method.clone(),
                     parts.uri.clone(),
                     parts.version,
                     parts.headers.clone(),
                     request_body.hook_bytes().clone(),
+                    request_body.metadata(),
                     now_millis(),
                 );
                 // Register before sending the event so the UI can always resolve.
@@ -915,8 +1033,11 @@ impl HttpHandler for CapturingHandler {
                             if let Ok(u) = uri.parse() {
                                 parts.uri = u;
                             }
-                            parts.headers = headers;
                             let hook_body = request_body.hook_bytes().clone();
+                            parts.headers = headers;
+                            if body != hook_body {
+                                reconcile_edited_body_headers(&mut parts.headers, &body);
+                            }
                             request_body.apply_modified_body(&hook_body, body);
                         }
                         Ok(Ok(InterceptDecision::Block { status, body })) => {
@@ -1005,6 +1126,20 @@ mod tests {
         assert!(!debug.contains("/path"));
         assert!(!debug.contains("x-original"));
         assert!(!debug.contains("request body"));
+    }
+
+    #[test]
+    fn edited_body_headers_drop_wire_encodings_and_refresh_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(http::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers.insert(http::header::CONTENT_LENGTH, "999".parse().unwrap());
+
+        reconcile_edited_body_headers(&mut headers, &Bytes::from_static(b"edited"));
+
+        assert!(!headers.contains_key(http::header::TRANSFER_ENCODING));
+        assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+        assert_eq!(headers[http::header::CONTENT_LENGTH], "6");
     }
 
     #[tokio::test]

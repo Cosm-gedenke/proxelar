@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 
-use chrono::{Local, TimeZone};
 use crossterm::event::{KeyCode, KeyEvent};
-use proxyapi::ProxyEvent;
-use proxyapi_models::{ProxiedRequest, ProxiedResponse, WsFrame};
+use proxyapi::{FlowFilter, ProxyEvent};
+use proxyapi_models::{
+    CapturedDnsExchange, CapturedTcpStream, CapturedUdpExchange, ProxiedRequest, ProxiedResponse,
+    WsFrame,
+};
 use ratatui::widgets::TableState;
 
 const MAX_ENTRIES: usize = 10_000;
@@ -35,6 +37,15 @@ pub enum FlowEntry {
         _response: Box<ProxiedResponse>,
         frames: VecDeque<WsFrame>,
         closed: bool,
+    },
+    Tcp {
+        stream: CapturedTcpStream,
+    },
+    Dns {
+        exchange: CapturedDnsExchange,
+    },
+    Udp {
+        exchange: CapturedUdpExchange,
     },
 }
 
@@ -257,153 +268,34 @@ pub struct AppState {
     pub frames_follow: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterColumn {
-    Time,
-    Proto,
-    Method,
-    Host,
-    Path,
-    Status,
-    Type,
-    Size,
-    Duration,
-}
-
-fn parse_filter(filter: &str) -> (Option<FilterColumn>, &str) {
-    if let Some(pos) = filter.find(':') {
-        let col = match filter[..pos].to_ascii_lowercase().as_str() {
-            "time" => Some(FilterColumn::Time),
-            "proto" => Some(FilterColumn::Proto),
-            "method" => Some(FilterColumn::Method),
-            "host" => Some(FilterColumn::Host),
-            "path" => Some(FilterColumn::Path),
-            "status" => Some(FilterColumn::Status),
-            "type" => Some(FilterColumn::Type),
-            "size" => Some(FilterColumn::Size),
-            "duration" => Some(FilterColumn::Duration),
-            _ => None,
-        };
-        if let Some(col) = col {
-            return (Some(col), &filter[pos + 1..]);
-        }
-    }
-    (None, filter)
-}
-
-fn proto_str(request: &ProxiedRequest, is_ws: bool) -> &'static str {
-    let tls = matches!(request.uri().scheme_str(), Some("https") | Some("wss"));
-    match (is_ws, tls) {
-        (true, true) => "wss",
-        (true, false) => "ws",
-        (false, true) => "https",
-        (false, false) => "http",
-    }
-}
-
-fn request_matches_column(
-    request: &ProxiedRequest,
-    col: FilterColumn,
-    val: &str,
-    is_ws: bool,
-) -> bool {
-    match col {
-        FilterColumn::Method => request.method().as_str().to_ascii_lowercase().contains(val),
-        FilterColumn::Host => request
-            .uri()
-            .host()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .contains(val),
-        FilterColumn::Path => request.uri().path().to_ascii_lowercase().contains(val),
-        FilterColumn::Proto => proto_str(request, is_ws).contains(val),
-        _ => false,
-    }
-}
-
-fn request_matches_any(request: &ProxiedRequest, val: &str) -> bool {
-    request.uri().to_string().to_ascii_lowercase().contains(val)
-        || request.method().as_str().to_ascii_lowercase().contains(val)
-}
-
 pub(crate) fn matches_filter(entry: &FlowEntry, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;
     };
-    let (col, value) = parse_filter(filter);
-    let value_lower = value.to_ascii_lowercase();
-    let val = value_lower.as_str();
+    let raw_filter = filter.to_ascii_lowercase();
+    let Ok(filter) = FlowFilter::parse(filter) else {
+        return false;
+    };
 
     match entry {
         FlowEntry::Complete {
             request, response, ..
-        } => match col {
-            Some(FilterColumn::Status) => response.status().as_u16().to_string().contains(val),
-            Some(FilterColumn::Size) => crate::interface::format_size(response.body().len())
-                .to_ascii_lowercase()
-                .contains(val),
-            Some(FilterColumn::Type) => response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains(val),
-            Some(FilterColumn::Duration) => {
-                let ms = response.time() - request.time();
-                format_duration_filter(ms).contains(val)
-            }
-            Some(FilterColumn::Time) => format_time_filter(request.time()).contains(val),
-            Some(col) => request_matches_column(request, col, val, false),
-            None => request_matches_any(request, val),
-        },
-        FlowEntry::Pending { request, .. } => match col {
-            Some(FilterColumn::Time) => format_time_filter(request.time()).contains(val),
-            Some(col) => request_matches_column(request, col, val, false),
-            None => request_matches_any(request, val),
-        },
-        FlowEntry::Error { message } => col.is_none() && message.to_ascii_lowercase().contains(val),
+        } => filter.matches(request, Some(response), false),
+        FlowEntry::Pending { request, .. } => filter.matches(request, None, false),
+        FlowEntry::Error { message } => message.to_ascii_lowercase().contains(&raw_filter),
         FlowEntry::WebSocket {
             request,
             _response: ws_response,
+            frames,
+            closed,
             ..
-        } => match col {
-            Some(FilterColumn::Method) => "get".contains(val),
-            Some(FilterColumn::Status) => ws_response.status().as_u16().to_string().contains(val),
-            Some(FilterColumn::Type) => ws_response
-                .headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains(val),
-            Some(FilterColumn::Duration) => {
-                let ms = ws_response.time() - request.time();
-                format_duration_filter(ms).contains(val)
-            }
-            Some(FilterColumn::Time) => format_time_filter(request.time()).contains(val),
-            Some(col) => request_matches_column(request, col, val, true),
-            None => request.uri().to_string().to_ascii_lowercase().contains(val),
-        },
-    }
-}
-
-fn format_time_filter(millis: i64) -> String {
-    Local
-        .timestamp_millis_opt(millis)
-        .single()
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_default()
-}
-
-fn format_duration_filter(ms: i64) -> String {
-    if ms < 0 {
-        return String::new();
-    }
-    if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{ms}ms")
+        } => {
+            let frames = frames.iter().cloned().collect::<Vec<_>>();
+            filter.matches_websocket(request, ws_response, &frames, *closed)
+        }
+        FlowEntry::Tcp { stream } => filter.matches_tcp(stream),
+        FlowEntry::Dns { exchange } => filter.matches_dns(exchange),
+        FlowEntry::Udp { exchange } => filter.matches_udp(exchange),
     }
 }
 
@@ -485,6 +377,76 @@ impl AppState {
                 {
                     *closed = true;
                 }
+            }
+            ProxyEvent::TcpConnected {
+                id,
+                target,
+                opened_at,
+            } => {
+                self.entries.push_back(FlowEntry::Tcp {
+                    stream: CapturedTcpStream {
+                        id,
+                        target,
+                        opened_at,
+                        chunks: Vec::new(),
+                        closed: false,
+                    },
+                });
+            }
+            ProxyEvent::TcpData { stream_id, chunk } => {
+                const MAX_CHUNKS: usize = 10_000;
+                if let Some(FlowEntry::Tcp { stream }) = self.entries.iter_mut().find(
+                    |entry| matches!(entry, FlowEntry::Tcp { stream } if stream.id == stream_id),
+                ) {
+                    if stream.chunks.len() < MAX_CHUNKS {
+                        stream.chunks.push(*chunk);
+                    }
+                }
+            }
+            ProxyEvent::TcpClosed { stream_id } => {
+                if let Some(FlowEntry::Tcp { stream }) = self.entries.iter_mut().find(
+                    |entry| matches!(entry, FlowEntry::Tcp { stream } if stream.id == stream_id),
+                ) {
+                    stream.closed = true;
+                }
+            }
+            ProxyEvent::DnsQuery {
+                id,
+                name,
+                query_type,
+                time,
+            } => {
+                self.entries.push_back(FlowEntry::Dns {
+                    exchange: CapturedDnsExchange {
+                        id,
+                        name,
+                        query_type,
+                        time,
+                        answers: Vec::new(),
+                        overridden: false,
+                        completed: false,
+                    },
+                });
+            }
+            ProxyEvent::DnsResponse {
+                id,
+                answers,
+                overridden,
+            } => {
+                if let Some(FlowEntry::Dns { exchange }) = self
+                    .entries
+                    .iter_mut()
+                    .find(|entry| matches!(entry, FlowEntry::Dns { exchange } if exchange.id == id))
+                {
+                    exchange.answers = answers;
+                    exchange.overridden = overridden;
+                    exchange.completed = true;
+                }
+            }
+            ProxyEvent::UdpExchange { exchange } => {
+                self.entries.push_back(FlowEntry::Udp {
+                    exchange: *exchange,
+                });
             }
         }
 
@@ -825,6 +787,64 @@ mod tests {
             }
             _ => panic!("expected websocket entry"),
         }
+    }
+
+    #[test]
+    fn app_state_tracks_and_filters_tcp_dns_and_udp_entries() {
+        let mut state = AppState::new();
+        state.add_event(ProxyEvent::TcpConnected {
+            id: 10,
+            target: "cache.example.test:6379".to_owned(),
+            opened_at: 1_000,
+        });
+        state.add_event(ProxyEvent::TcpData {
+            stream_id: 10,
+            chunk: Box::new(proxyapi_models::TcpChunk {
+                direction: proxyapi_models::StreamDirection::ClientToServer,
+                time: 1_001,
+                payload: Bytes::from_static(b"SET key value"),
+                truncated: false,
+            }),
+        });
+        state.add_event(ProxyEvent::TcpClosed { stream_id: 10 });
+        state.add_event(ProxyEvent::DnsQuery {
+            id: 11,
+            name: "api.example.test".to_owned(),
+            query_type: 1,
+            time: 1_002,
+        });
+        state.add_event(ProxyEvent::DnsResponse {
+            id: 11,
+            answers: vec!["127.0.0.1".to_owned()],
+            overridden: true,
+        });
+        state.add_event(ProxyEvent::UdpExchange {
+            exchange: Box::new(CapturedUdpExchange {
+                id: 12,
+                target: "127.0.0.1:9000".to_owned(),
+                client: "127.0.0.1:50000".to_owned(),
+                time: 1_003,
+                request: Bytes::from_static(b"ping"),
+                response: Bytes::new(),
+                response_received: true,
+                request_truncated: false,
+                response_truncated: false,
+            }),
+        });
+
+        assert_eq!(state.entries.len(), 3);
+        assert!(matches_filter(
+            &state.entries[0],
+            Some("proto:tcp & body:value & status:closed")
+        ));
+        assert!(matches_filter(
+            &state.entries[1],
+            Some("proto:dns & host:api.example & status:override")
+        ));
+        assert!(matches_filter(
+            &state.entries[2],
+            Some("proto:udp & body:ping & status:complete")
+        ));
     }
 
     #[test]

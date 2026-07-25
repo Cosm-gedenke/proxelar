@@ -131,7 +131,7 @@ pub fn handle_key_event(
                 // Try to parse first; only clear the session on success.
                 let id = session.id;
                 let text = session.to_text();
-                match parse_raw_http_request(&text) {
+                match parse_edited_http_request(&text, session.binary_body) {
                     Ok((method, uri, headers, body)) => {
                         state.edit_session = None;
                         intercept.resolve(
@@ -206,8 +206,8 @@ pub fn handle_key_event(
 
 /// Serialise a `ProxiedRequest` as raw HTTP text for inline editing.
 ///
-/// Returns `(text, binary_body)` where `binary_body` is true when the body
-/// is not valid UTF-8 (the text will contain the lossy representation).
+/// Returns `(text, binary_body)` where Protobuf/MessagePack bodies use a
+/// structured JSON marker and other invalid UTF-8 bodies use hexadecimal.
 fn request_to_text(req: &proxyapi_models::ProxiedRequest) -> (String, bool) {
     let mut text = format!("{} {} {:?}\n", req.method(), req.uri(), req.version());
     for (name, value) in req.headers() {
@@ -218,9 +218,28 @@ fn request_to_text(req: &proxyapi_models::ProxiedRequest) -> (String, bool) {
         ));
     }
     text.push('\n');
-    let binary_body = !req.body().is_empty() && std::str::from_utf8(req.body()).is_err();
+    let structured = proxyapi::content::editable_content(req.headers(), req.body())
+        .ok()
+        .flatten();
+    let binary_body = structured.is_some()
+        || (!req.body().is_empty() && std::str::from_utf8(req.body()).is_err());
     if !req.body().is_empty() {
-        text.push_str(&String::from_utf8_lossy(req.body()));
+        if let Some(editor) = structured {
+            text.push_str("@proxelar:");
+            text.push_str(editor.format.as_str());
+            text.push('\n');
+            text.push_str(&editor.text);
+        } else if binary_body {
+            text.push_str("@proxelar:hex\n");
+            for (index, byte) in req.body().iter().enumerate() {
+                if index > 0 {
+                    text.push(if index % 16 == 0 { '\n' } else { ' ' });
+                }
+                text.push_str(&format!("{byte:02x}"));
+            }
+        } else {
+            text.push_str(&String::from_utf8_lossy(req.body()));
+        }
     }
     (text, binary_body)
 }
@@ -241,9 +260,18 @@ fn parse_raw_http_request(text: &str) -> Result<(String, String, http::HeaderMap
         .next()
         .ok_or("Missing request line")?
         .trim_end();
-    let mut fields = request_line.splitn(3, ' ');
+    let mut fields = request_line.split_whitespace();
     let method = fields.next().ok_or("Missing method")?.trim().to_uppercase();
     let uri = fields.next().ok_or("Missing URI")?.trim().to_string();
+    let version = fields.next().ok_or("Missing HTTP version")?;
+    if fields.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err("Request line must end with HTTP/1.0 or HTTP/1.1".to_owned());
+    }
+    method
+        .parse::<http::Method>()
+        .map_err(|error| format!("Invalid method: {error}"))?;
+    uri.parse::<http::Uri>()
+        .map_err(|error| format!("Invalid URI: {error}"))?;
 
     let mut headers = http::HeaderMap::new();
     for line in header_lines {
@@ -251,20 +279,58 @@ fn parse_raw_http_request(text: &str) -> Result<(String, String, http::HeaderMap
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim();
-            let value = value.trim();
-            if let (Ok(n), Ok(v)) = (
-                http::header::HeaderName::from_bytes(name.as_bytes()),
-                http::header::HeaderValue::from_str(value),
-            ) {
-                headers.append(n, v);
-            }
-        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| format!("Invalid header line: {line}"))?;
+        let name = http::header::HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|error| format!("Invalid header name: {error}"))?;
+        let value = http::header::HeaderValue::from_str(value.trim())
+            .map_err(|error| format!("Invalid header value: {error}"))?;
+        headers.append(name, value);
     }
 
     let body = Bytes::copy_from_slice(body_str.as_bytes());
     Ok((method, uri, headers, body))
+}
+
+fn parse_edited_http_request(
+    text: &str,
+    binary_body: bool,
+) -> Result<(String, String, http::HeaderMap, Bytes), String> {
+    let (method, uri, headers, body) = parse_raw_http_request(text)?;
+    if !binary_body {
+        return Ok((method, uri, headers, body));
+    }
+    let body = std::str::from_utf8(&body).map_err(|_| "Hex editor body is not UTF-8")?;
+    if let Some(document) = body.strip_prefix("@proxelar:protobuf\n") {
+        return proxyapi::content::encode_edit("protobuf", document)
+            .map(|body| (method, uri, headers, body))
+            .map_err(|error| error.to_string());
+    }
+    if let Some(document) = body.strip_prefix("@proxelar:messagepack\n") {
+        return proxyapi::content::encode_edit("messagepack", document)
+            .map(|body| (method, uri, headers, body))
+            .map_err(|error| error.to_string());
+    }
+    let hex = body
+        .strip_prefix("@proxelar:hex\n")
+        .ok_or("Binary body must keep a supported @proxelar marker")?;
+    let compact = hex
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if compact.len() % 2 != 0 {
+        return Err("Hex body must contain pairs of digits".to_owned());
+    }
+    let decoded = compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| "Invalid hex body")?;
+            u8::from_str_radix(pair, 16).map_err(|_| "Invalid hex body")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((method, uri, headers, Bytes::from(decoded)))
 }
 
 #[cfg(test)]
@@ -311,13 +377,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_http_request_rejects_malformed_request_lines_and_headers() {
+        for text in [
+            "GET /missing-version\n\n",
+            "GET %%% HTTP/1.1\n\n",
+            "GET / HTTP/2\n\n",
+            "GET / HTTP/1.1\ninvalid header\n\n",
+        ] {
+            assert!(
+                parse_raw_http_request(text).is_err(),
+                "should reject {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn request_to_text_preserves_headers_and_marks_binary_body() {
         let (text, binary_body) = request_to_text(&request(Bytes::from_static(b"\xff\x00")));
 
         assert!(text.starts_with("POST http://api.test/path?x=1 HTTP/1.1\n"));
         assert!(text.contains("x-test: one\n"));
         assert!(text.contains("x-test: two\n"));
+        assert!(text.ends_with("@proxelar:hex\nff 00"));
         assert!(binary_body);
+        let (_, _, _, body) = parse_edited_http_request(&text, binary_body).unwrap();
+        assert_eq!(body.as_ref(), b"\xff\x00");
+    }
+
+    #[test]
+    fn request_to_text_roundtrips_structured_protobuf_fields() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "application/x-protobuf".parse().unwrap(),
+        );
+        let request = ProxiedRequest::new(
+            Method::POST,
+            "http://api.test/protobuf".parse().unwrap(),
+            Version::HTTP_11,
+            headers,
+            Bytes::from_static(&[0x08, 0x96, 0x01]),
+            100,
+        );
+        let (text, structured) = request_to_text(&request);
+        assert!(structured);
+        assert!(text.contains("@proxelar:protobuf\n"));
+        assert!(text.contains("\"value\": \"150\""));
+        let edited = text.replacen("\"150\"", "\"151\"", 1);
+        let (_, _, _, body) = parse_edited_http_request(&edited, true).unwrap();
+        assert_eq!(body.as_ref(), &[0x08, 0x97, 0x01]);
     }
 
     #[test]

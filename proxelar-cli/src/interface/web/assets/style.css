@@ -87,6 +87,39 @@ main {
     overflow: auto;
 }
 
+.wireguard-setup {
+    min-height: 100%;
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    text-align: center;
+}
+
+.wireguard-setup h2 {
+    color: var(--text);
+    font-size: 20px;
+}
+
+.wireguard-setup img {
+    width: min(420px, 75vw, 65vh);
+    height: min(420px, 75vw, 65vh);
+    background: #fff;
+    padding: 8px;
+    border-radius: 8px;
+}
+
+.wireguard-setup p {
+    max-width: 620px;
+    color: var(--text-muted);
+}
+
+.wireguard-setup .wireguard-secret {
+    font-size: 12px;
+}
+
 table {
     width: 100%;
     border-collapse: collapse;
@@ -115,6 +148,8 @@ td {
 
 tr:hover { background: var(--highlight); cursor: pointer; }
 tr.selected { background: var(--highlight); }
+
+.hidden { display: none !important; }
 
 .td-with-action { white-space: nowrap; }
 
@@ -345,6 +380,21 @@ tr.pending:hover { background: rgba(245, 158, 11, 0.12); }
     resize: vertical;
 }
 
+.body-mode {
+    margin-left: 8px;
+    padding: 2px 6px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: monospace;
+}
+
+.syntax-key { color: #7dd3fc; }
+.syntax-string { color: #86efac; }
+.syntax-number { color: #fbbf24; }
+.syntax-literal { color: #c4b5fd; }
+
 .intercept-footer {
     display: flex;
     justify-content: space-between;
@@ -476,6 +526,16 @@ tr.pending:hover { background: rgba(245, 158, 11, 0.12); }
     font-size: 13px;
     white-space: pre-wrap;
     word-break: break-all;
+}
+
+.content-image-preview {
+    display: block;
+    max-width: 100%;
+    max-height: 70vh;
+    margin-top: 12px;
+    object-fit: contain;
+    background: repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 / 16px 16px;
+    border: 1px solid var(--border);
 }
 
 /* ── Help button ─────────────────────────────────────────────────────── */

@@ -3,8 +3,9 @@
 //! Users write Lua scripts defining `on_request` and/or `on_response` hooks.
 //! The proxy calls these hooks for every request/response passing through.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
@@ -44,6 +45,14 @@ pub enum ScriptResponseAction {
     PassThrough,
 }
 
+/// Action returned by the optional Lua `on_websocket_frame` hook.
+#[derive(Debug)]
+pub enum ScriptWebSocketAction {
+    PassThrough,
+    Forward(Bytes),
+    Drop,
+}
+
 /// Lua scripting engine that loads a user script and invokes its hooks.
 ///
 /// Thread-safe: the internal `Lua` VM is protected by a `std::sync::Mutex`.
@@ -53,7 +62,13 @@ pub enum ScriptResponseAction {
 /// `Lua` with the `send` feature is `Send`, and `Mutex<T: Send>` is both
 /// `Send` and `Sync`, so `ScriptEngine` is automatically `Send + Sync`.
 pub struct ScriptEngine {
-    lua: Mutex<Lua>,
+    state: Mutex<ScriptState>,
+    script_path: PathBuf,
+}
+
+struct ScriptState {
+    lua: Lua,
+    signature: Option<(SystemTime, u64)>,
 }
 
 impl ScriptEngine {
@@ -61,38 +76,65 @@ impl ScriptEngine {
     ///
     /// The script should define `on_request(request)` and/or `on_response(request, response)`.
     pub fn new(script_path: &Path) -> Result<Self, crate::Error> {
-        Self::load(script_path, Lua::new())
+        Self::load(script_path)
     }
 
-    /// Like [`new`](Self::new), but the VM can load native Lua C modules
-    /// (e.g. `lua-protobuf`). This drops mlua's safety guarantees: a loaded
-    /// module runs unsandboxed native code in the proxy. Only use trusted scripts.
-    pub fn new_allowing_c_modules(script_path: &Path) -> Result<Self, crate::Error> {
-        // SAFETY: opt-in via `--allow-c-modules`; the operator accepts that
-        // scripts may load native modules that run outside Rust's guarantees.
-        #[allow(unsafe_code)]
-        let lua = unsafe { Lua::unsafe_new() };
-        Self::load(script_path, lua)
-    }
-
-    fn load(script_path: &Path, lua: Lua) -> Result<Self, crate::Error> {
-        let script = std::fs::read_to_string(script_path).map_err(|e| {
-            crate::Error::Script(format!(
-                "Failed to read script {}: {e}",
-                script_path.display()
-            ))
-        })?;
-
-        lua.load(&script).exec().map_err(|e| {
-            crate::Error::Script(format!(
-                "Failed to execute script {}: {e}",
-                script_path.display()
-            ))
-        })?;
-
+    fn load(script_path: &Path) -> Result<Self, crate::Error> {
+        let script_path = resolve_script_path(script_path)?;
+        let lua = Lua::new();
+        load_script(&script_path, &lua)?;
+        let signature = script_signature(&script_path).ok();
         Ok(Self {
-            lua: Mutex::new(lua),
+            state: Mutex::new(ScriptState { lua, signature }),
+            script_path,
         })
+    }
+
+    /// Reload the script after a file change. Invalid updates are logged and
+    /// the last known-good VM remains active, so traffic continues to pass.
+    fn lock_reloaded(&self) -> MutexGuard<'_, ScriptState> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Ok(signature) = script_signature(&self.script_path) else {
+            return state;
+        };
+        if state.signature == Some(signature) {
+            return state;
+        }
+
+        let lua = Lua::new();
+        match load_script(&self.script_path, &lua) {
+            Ok(()) => {
+                state.lua = lua;
+                state.signature = Some(signature);
+                tracing::info!("Reloaded Lua script: {}", self.script_path.display());
+            }
+            Err(error) => {
+                // Remember this signature to avoid retrying the same broken
+                // contents on every request. A subsequent edit retries.
+                state.signature = Some(signature);
+                tracing::warn!(
+                    "Lua script reload failed; keeping last known-good version: {error}"
+                );
+            }
+        }
+        state
+    }
+
+    /// Force a reload now, retaining the current script when the new contents
+    /// are invalid.
+    pub fn reload(&self) -> Result<(), crate::Error> {
+        let lua = Lua::new();
+        load_script(&self.script_path, &lua)?;
+        let signature = script_signature(&self.script_path).ok();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.lua = lua;
+        state.signature = signature;
+        Ok(())
+    }
+
+    /// Path watched for script changes.
+    pub fn script_path(&self) -> &Path {
+        &self.script_path
     }
 
     /// Call the Lua `on_request` hook if it exists.
@@ -103,7 +145,8 @@ impl ScriptEngine {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<ScriptRequestAction, crate::Error> {
-        let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock_reloaded();
+        let lua = &state.lua;
 
         let globals = lua.globals();
         let func: mlua::Function = match globals.get("on_request") {
@@ -111,7 +154,7 @@ impl ScriptEngine {
             Err(_) => return Ok(ScriptRequestAction::PassThrough),
         };
 
-        let req_table = request_to_lua_table(&lua, method, url, headers, body)
+        let req_table = request_to_lua_table(lua, method, url, headers, body)
             .map_err(|e| crate::Error::Script(format!("Failed to build request table: {e}")))?;
 
         let result: Value = func
@@ -180,7 +223,8 @@ impl ScriptEngine {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<ScriptResponseAction, crate::Error> {
-        let lua = self.lua.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock_reloaded();
+        let lua = &state.lua;
 
         let globals = lua.globals();
         let func: mlua::Function = match globals.get("on_response") {
@@ -198,7 +242,7 @@ impl ScriptEngine {
             })
             .map_err(|e| crate::Error::Script(format!("Failed to build request context: {e}")))?;
 
-        let res_table = response_to_lua_table(&lua, status, headers, body)
+        let res_table = response_to_lua_table(lua, status, headers, body)
             .map_err(|e| crate::Error::Script(format!("Failed to build response table: {e}")))?;
 
         let result: Value = func
@@ -231,6 +275,107 @@ impl ScriptEngine {
             ))),
         }
     }
+
+    /// Call `on_websocket_frame(frame)` when it exists. The hook may return
+    /// `nil` to pass through, `false` to drop, or a string payload to replace.
+    pub fn on_websocket_frame(
+        &self,
+        direction: &str,
+        opcode: &str,
+        payload: &[u8],
+    ) -> Result<ScriptWebSocketAction, crate::Error> {
+        let state = self.lock_reloaded();
+        let lua = &state.lua;
+        let globals = lua.globals();
+        let function: mlua::Function = match globals.get("on_websocket_frame") {
+            Ok(function) => function,
+            Err(_) => return Ok(ScriptWebSocketAction::PassThrough),
+        };
+        let frame = lua
+            .create_table()
+            .and_then(|frame| {
+                frame.set("direction", direction)?;
+                frame.set("opcode", opcode)?;
+                frame.set("payload", lua.create_string(payload)?)?;
+                Ok(frame)
+            })
+            .map_err(|error| {
+                crate::Error::Script(format!("Failed to build WebSocket frame table: {error}"))
+            })?;
+        match function
+            .call::<Value>(frame)
+            .map_err(|error| crate::Error::Script(format!("on_websocket_frame error: {error}")))?
+        {
+            Value::Nil => Ok(ScriptWebSocketAction::PassThrough),
+            Value::Boolean(false) => Ok(ScriptWebSocketAction::Drop),
+            Value::String(payload) => Ok(ScriptWebSocketAction::Forward(Bytes::copy_from_slice(
+                &payload.as_bytes(),
+            ))),
+            other => Err(crate::Error::Script(format!(
+                "on_websocket_frame must return a string, false, or nil, got: {other:?}"
+            ))),
+        }
+    }
+}
+
+fn script_signature(script_path: &Path) -> Result<(SystemTime, u64), crate::Error> {
+    let metadata = std::fs::metadata(script_path).map_err(|error| {
+        crate::Error::Script(format!(
+            "Failed to inspect script {}: {error}",
+            script_path.display()
+        ))
+    })?;
+    Ok((
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        metadata.len(),
+    ))
+}
+
+fn load_script(script_path: &Path, lua: &Lua) -> Result<(), crate::Error> {
+    if let Some(directory) = script_path.parent() {
+        if let Ok(package) = lua.globals().get::<mlua::Table>("package") {
+            let current = package.get::<String>("path").unwrap_or_default();
+            let directory = directory.to_string_lossy();
+            let path = format!("{directory}/?.lua;{directory}/?/init.lua;{current}");
+            package.set("path", path).map_err(|error| {
+                crate::Error::Script(format!("Failed to configure Lua module path: {error}"))
+            })?;
+        }
+    }
+    let script = std::fs::read_to_string(script_path).map_err(|e| {
+        crate::Error::Script(format!(
+            "Failed to read script {}: {e}",
+            script_path.display()
+        ))
+    })?;
+
+    lua.load(&script).exec().map_err(|e| {
+        crate::Error::Script(format!(
+            "Failed to execute script {}: {e}",
+            script_path.display()
+        ))
+    })
+}
+
+fn resolve_script_path(script_path: &Path) -> Result<PathBuf, crate::Error> {
+    if !script_path.is_dir() {
+        return Ok(script_path.to_owned());
+    }
+
+    let manifest_path = script_path.join(crate::addon::ADDON_MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return Ok(script_path.join("init.lua"));
+    }
+
+    let package = crate::addon::AddonPackage::load(script_path)
+        .map_err(|error| crate::Error::Script(format!("Invalid addon package: {error}")))?;
+    if package.manifest().requires_native_modules {
+        return Err(crate::Error::Script(format!(
+            "Addon {} requires native Lua modules, which are prohibited by proxyapi's unsafe-code policy",
+            package.manifest().name
+        )));
+    }
+    Ok(package.entrypoint().to_owned())
 }
 
 /// Convert an HTTP `HeaderMap` to a Lua table.
@@ -335,7 +480,7 @@ fn response_to_lua_table(
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn engine_from_script(script: &str) -> ScriptEngine {
         let mut f = NamedTempFile::new().unwrap();
@@ -344,37 +489,17 @@ mod tests {
         ScriptEngine::new(f.path()).unwrap()
     }
 
-    fn engine_from_script_with<F>(script: &str, build: F) -> Result<(), crate::Error>
-    where
-        F: FnOnce(&Path) -> Result<ScriptEngine, crate::Error>,
-    {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(script.as_bytes()).unwrap();
-        f.flush().unwrap();
-        build(f.path()).map(drop)
-    }
-
     #[test]
     fn test_safe_mode_blocks_c_modules() {
-        let err = engine_from_script_with(
-            r#"package.loadlib("whatever.so", "luaopen_whatever")"#,
-            ScriptEngine::new,
-        )
-        .unwrap_err()
-        .to_string();
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(br#"package.loadlib("whatever.so", "luaopen_whatever")"#)
+            .unwrap();
+        file.flush().unwrap();
+        let err = match ScriptEngine::new(file.path()) {
+            Ok(_) => panic!("native module loading should fail in safe mode"),
+            Err(error) => error.to_string(),
+        };
         assert!(err.contains("safe mode"), "got: {err}");
-    }
-
-    #[test]
-    fn test_allowing_c_modules_exposes_loadlib() {
-        // Unsafe mode: the missing library fails on the file, not on safe mode.
-        let err = engine_from_script_with(
-            r#"assert(package.loadlib("./does-not-exist.so", "luaopen_x"))"#,
-            ScriptEngine::new_allowing_c_modules,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(!err.contains("safe mode"), "got: {err}");
     }
 
     #[test]
@@ -449,6 +574,158 @@ mod tests {
             }
             _ => panic!("Expected Forward"),
         }
+    }
+
+    #[test]
+    fn addon_directory_loads_init_and_relative_lua_modules() {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("addon.lua"),
+            r#"return { value = "community-addon" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("init.lua"),
+            r#"
+                local addon = require("addon")
+                function on_request(req)
+                    req.headers["x-addon"] = addon.value
+                    return req
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = ScriptEngine::new(directory.path()).unwrap();
+        let action = engine
+            .on_request("GET", "http://example.test", &HeaderMap::new(), b"")
+            .unwrap();
+        assert!(matches!(
+            action,
+            ScriptRequestAction::Forward { headers, .. }
+                if headers["x-addon"] == "community-addon"
+        ));
+        assert_eq!(engine.script_path(), directory.path().join("init.lua"));
+    }
+
+    #[test]
+    fn manifested_addon_uses_validated_entrypoint() {
+        let directory = tempdir().unwrap();
+        let script = br#"
+            function on_request(req)
+                req.headers["x-addon"] = "manifested"
+                return req
+            end
+        "#;
+        std::fs::write(directory.path().join("main.lua"), script).unwrap();
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(script);
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        std::fs::write(
+            directory.path().join(crate::addon::ADDON_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "name": "manifested-addon",
+                "version": "1.0.0",
+                "description": "test package",
+                "entrypoint": "main.lua",
+                "hooks": ["request"],
+                "files": { "main.lua": digest }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let engine = ScriptEngine::new(directory.path()).unwrap();
+        let action = engine
+            .on_request("GET", "http://example.test", &HeaderMap::new(), b"")
+            .unwrap();
+        assert!(matches!(
+            action,
+            ScriptRequestAction::Forward { headers, .. }
+                if headers["x-addon"] == "manifested"
+        ));
+        assert_eq!(
+            engine.script_path(),
+            directory.path().join("main.lua").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn reloads_changed_script_and_keeps_last_good_version() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"function on_request(req) req.headers["x-version"] = "one" return req end"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let engine = ScriptEngine::new(file.path()).unwrap();
+
+        std::fs::write(
+            file.path(),
+            br#"function on_request(req) req.headers["x-version"] = "version-two" return req end"#,
+        )
+        .unwrap();
+        let action = engine
+            .on_request("GET", "http://example.test", &HeaderMap::new(), b"")
+            .unwrap();
+        match action {
+            ScriptRequestAction::Forward { headers, .. } => {
+                assert_eq!(headers["x-version"], "version-two");
+            }
+            _ => panic!("expected modified request"),
+        }
+
+        std::fs::write(
+            file.path(),
+            b"this is invalid Lua and deliberately longer than before",
+        )
+        .unwrap();
+        let action = engine
+            .on_request("GET", "http://example.test", &HeaderMap::new(), b"")
+            .unwrap();
+        match action {
+            ScriptRequestAction::Forward { headers, .. } => {
+                assert_eq!(headers["x-version"], "version-two");
+            }
+            _ => panic!("expected last known-good request hook"),
+        }
+    }
+
+    #[test]
+    fn websocket_hook_can_modify_drop_and_pass_frames() {
+        let engine = engine_from_script(
+            r#"
+            function on_websocket_frame(frame)
+                if frame.payload == "drop" then return false end
+                if frame.direction == "client_to_server" then return "changed" end
+                return nil
+            end
+            "#,
+        );
+        assert!(matches!(
+            engine
+                .on_websocket_frame("client_to_server", "text", b"hello")
+                .unwrap(),
+            ScriptWebSocketAction::Forward(payload) if payload == "changed"
+        ));
+        assert!(matches!(
+            engine
+                .on_websocket_frame("server_to_client", "text", b"drop")
+                .unwrap(),
+            ScriptWebSocketAction::Drop
+        ));
+        assert!(matches!(
+            engine
+                .on_websocket_frame("server_to_client", "text", b"hello")
+                .unwrap(),
+            ScriptWebSocketAction::PassThrough
+        ));
     }
 
     #[test]

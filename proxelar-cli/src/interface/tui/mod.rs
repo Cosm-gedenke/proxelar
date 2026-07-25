@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::wireguard_setup::WireGuardSetup;
 use event::{spawn_event_loop, AppEvent};
 use handler::handle_key_event;
 use state::AppState;
@@ -34,9 +35,10 @@ pub async fn run(
     event_rx: mpsc::Receiver<ProxyEvent>,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
+    wireguard_setup: Option<Arc<WireGuardSetup>>,
     cancel: CancellationToken,
 ) {
-    if let Err(e) = run_inner(event_rx, intercept, replay_tx, cancel).await {
+    if let Err(e) = run_inner(event_rx, intercept, replay_tx, wireguard_setup, cancel).await {
         eprintln!("TUI error: {e}");
     }
 }
@@ -45,6 +47,7 @@ async fn run_inner(
     event_rx: mpsc::Receiver<ProxyEvent>,
     intercept: Arc<InterceptConfig>,
     replay_tx: mpsc::Sender<ProxiedRequest>,
+    wireguard_setup: Option<Arc<WireGuardSetup>>,
     cancel: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
@@ -78,7 +81,7 @@ async fn run_inner(
                 state.add_event(proxy_event);
             }
             AppEvent::Render => {
-                terminal.draw(|f| draw(f, &mut state))?;
+                terminal.draw(|f| draw(f, &mut state, wireguard_setup.as_deref()))?;
             }
         }
     }

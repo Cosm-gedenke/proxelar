@@ -21,6 +21,12 @@
     </header>
 
     <main>
+        <section id="wireguard-setup" class="wireguard-setup hidden">
+            <h2>Connect a WireGuard device</h2>
+            <img id="wireguard-qr" alt="WireGuard client configuration QR code">
+            <p>In the WireGuard app, add a tunnel by scanning this QR code, then enable it.</p>
+            <p class="wireguard-secret">This QR contains the client private key. Show it only on a trusted screen.</p>
+        </section>
         <table id="requests-table">
             <thead>
                 <tr>
@@ -77,7 +83,14 @@
             <table id="headers-table" class="headers-table">
                 <tbody id="headers-body"></tbody>
             </table>
-            <div class="intercept-section-label">Body</div>
+            <div class="intercept-section-label">Body
+                <select id="edit-body-mode" class="body-mode" aria-label="Body editor encoding">
+                    <option value="text">Text</option>
+                    <option value="hex">Hex bytes</option>
+                    <option value="protobuf">Protobuf fields (JSON)</option>
+                    <option value="messagepack">MessagePack (JSON)</option>
+                </select>
+            </div>
             <textarea id="edit-body" class="edit-body" placeholder="Request body..."></textarea>
         </div>
         <div class="intercept-footer">

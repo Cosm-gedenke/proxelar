@@ -1,6 +1,12 @@
+mod dns;
 pub(crate) mod forward;
+mod outbound;
+mod raw;
 pub(crate) mod reverse;
+mod socks;
 mod tls;
+mod udp;
+mod wireguard;
 
 use std::{error::Error as StdError, future::Future, net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -12,7 +18,6 @@ use hyper::header::{
 use hyper::rt::{Read, Write};
 use hyper::service::Service;
 use hyper::{HeaderMap, Request, Response, Uri};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto;
 use proxyapi_models::ProxiedRequest;
@@ -28,11 +33,16 @@ use crate::intercept::InterceptConfig;
 #[cfg(feature = "scripting")]
 use crate::scripting::ScriptEngine;
 
+pub use dns::DnsConfig;
+pub use outbound::UpstreamProxyConfig;
 pub use tls::UpstreamTlsConfig;
+pub use wireguard::WireGuardConfig;
 
 /// Shared HTTP(S) client type used by both forward and reverse proxy.
-pub(crate) type Client =
-    hyper_util::client::legacy::Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyBody>;
+pub(crate) type Client = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<outbound::OutboundConnector>,
+    ProxyBody,
+>;
 pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;
 
 const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
@@ -150,7 +160,7 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<HeaderName> {
 pub struct ProxyConfig {
     /// Address to listen on.
     pub addr: SocketAddr,
-    /// Forward or reverse proxy mode.
+    /// Listener and capture mode.
     pub mode: ProxyMode,
     /// Channel for emitting captured proxy events.
     pub event_tx: mpsc::Sender<ProxyEvent>,
@@ -167,17 +177,11 @@ pub struct ProxyConfig {
     /// Optional path to a Lua script for request/response hooks.
     #[cfg(feature = "scripting")]
     pub script_path: Option<PathBuf>,
-    /// Allow the Lua script to load native C modules (e.g. `lua-protobuf`).
-    ///
-    /// This runs the VM in mlua's unsafe mode; see
-    /// [`ScriptEngine::new_allowing_c_modules`](crate::scripting::ScriptEngine::new_allowing_c_modules).
-    #[cfg(feature = "scripting")]
-    pub allow_c_modules: bool,
     /// Optional channel for receiving replay requests from the UI.
     pub replay_rx: Option<mpsc::Receiver<ProxiedRequest>>,
 }
 
-/// Whether the proxy operates in forward (CONNECT tunneling) or reverse mode.
+/// Listener and capture topology used by the proxy.
 #[derive(Debug, Clone)]
 pub enum ProxyMode {
     /// Forward proxy: clients send CONNECT requests, proxy tunnels and intercepts.
@@ -187,24 +191,69 @@ pub enum ProxyMode {
         /// Target upstream (must include scheme and authority, e.g. `http://localhost:3000`).
         target: Uri,
     },
+    /// SOCKS5 listener with HTTP/HTTPS inspection and raw TCP fallback.
+    Socks5,
+    /// UDP DNS inspection/override mode.
+    Dns { config: DnsConfig },
+    /// Raw UDP request/response inspection through a fixed target.
+    Udp { target: SocketAddr },
+    /// Privilege-free WireGuard endpoint with userspace TCP/UDP reconstruction.
+    WireGuard { config: WireGuardConfig },
 }
 
 /// The proxy server.
 pub struct Proxy {
     config: ProxyConfig,
+    route_rules: Option<Arc<crate::rules::RouteRules>>,
+    upstream_proxy: Option<UpstreamProxyConfig>,
 }
 
 impl Proxy {
     /// Create a new proxy with the given configuration.
     pub const fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            route_rules: None,
+            upstream_proxy: None,
+        }
+    }
+
+    /// Attach declarative map-local, map-remote, redirect, mock, and header rules.
+    #[must_use]
+    pub fn with_route_rules(mut self, rules: Arc<crate::rules::RouteRules>) -> Self {
+        self.route_rules = Some(rules);
+        self
+    }
+
+    /// Chain all upstream requests through an HTTP CONNECT or SOCKS5 proxy.
+    #[must_use]
+    pub fn with_upstream_proxy(mut self, proxy: UpstreamProxyConfig) -> Self {
+        self.upstream_proxy = Some(proxy);
+        self
     }
 
     /// Start the proxy and run until the `shutdown` future resolves.
     pub async fn start(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
-        let listener = TcpListener::bind(self.config.addr).await?;
-        tracing::info!("Proxy listening on {}", self.config.addr);
-
+        if let ProxyMode::Dns { config } = &self.config.mode {
+            return dns::serve(
+                self.config.addr,
+                config.clone(),
+                self.config.event_tx.clone(),
+                shutdown,
+            )
+            .await
+            .map_err(Error::Io);
+        }
+        if let ProxyMode::Udp { target } = &self.config.mode {
+            return udp::serve(
+                self.config.addr,
+                *target,
+                self.config.event_tx.clone(),
+                shutdown,
+            )
+            .await
+            .map_err(Error::Io);
+        }
         // Load Lua script engine if a script path was provided.
         #[cfg(feature = "scripting")]
         let script_engine: Option<Arc<ScriptEngine>> = self
@@ -213,14 +262,7 @@ impl Proxy {
             .as_ref()
             .map(|p| {
                 tracing::info!("Loading Lua script: {}", p.display());
-                if self.config.allow_c_modules {
-                    tracing::warn!(
-                        "Lua C module loading is enabled; scripts run unsandboxed native code"
-                    );
-                    ScriptEngine::new_allowing_c_modules(p).map(Arc::new)
-                } else {
-                    ScriptEngine::new(p).map(Arc::new)
-                }
+                ScriptEngine::new(p).map(Arc::new)
             })
             .transpose()?;
 
@@ -234,18 +276,48 @@ impl Proxy {
             );
         }
 
-        let tls_config = tls::build_client_config(&self.config.upstream_tls)?;
+        let tls_config = Arc::new(tls::build_client_config(&self.config.upstream_tls)?);
+        let outbound = outbound::OutboundConnector::new(self.upstream_proxy.as_ref())?;
         let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
+            .with_tls_config((*tls_config).clone())
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(outbound.clone());
 
         let client = Arc::new(
             hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(https),
         );
-
         let mut replay_rx = self.config.replay_rx;
+
+        if let ProxyMode::WireGuard { config } = &self.config.mode {
+            let mut handler = CapturingHandler::new(self.config.event_tx.clone())
+                .with_body_capture_limit(self.config.body_capture_limit);
+            if let Some(ref intercept) = self.config.intercept {
+                handler = handler.with_intercept(Arc::clone(intercept));
+            }
+            if let Some(ref rules) = self.route_rules {
+                handler = handler.with_route_rules(Arc::clone(rules));
+            }
+            #[cfg(feature = "scripting")]
+            if let Some(ref engine) = script_engine {
+                handler = handler.with_script_engine(Arc::clone(engine));
+            }
+            return wireguard::serve(
+                self.config.addr,
+                config.clone(),
+                handler,
+                ca,
+                client,
+                self.config.event_tx.clone(),
+                replay_rx,
+                shutdown,
+            )
+            .await
+            .map_err(Error::Io);
+        }
+
+        let listener = TcpListener::bind(self.config.addr).await?;
+        tracing::info!("Proxy listening on {}", self.config.addr);
 
         tokio::pin!(shutdown);
 
@@ -264,12 +336,17 @@ impl Proxy {
                     if let Some(ref ic) = self.config.intercept {
                         handler = handler.with_intercept(Arc::clone(ic));
                     }
+                    if let Some(ref rules) = self.route_rules {
+                        handler = handler.with_route_rules(Arc::clone(rules));
+                    }
                     #[cfg(feature = "scripting")]
                     if let Some(ref engine) = script_engine {
                         handler = handler.with_script_engine(Arc::clone(engine));
                     }
                     let ca = Arc::clone(&ca);
                     let client = Arc::clone(&client);
+                    let outbound = outbound.clone();
+                    let upstream_tls = Arc::clone(&tls_config);
 
                     match &self.config.mode {
                         ProxyMode::Forward => {
@@ -284,6 +361,22 @@ impl Proxy {
                                 stream, remote_addr, handler, target, client,
                             ));
                         }
+                        ProxyMode::Socks5 => {
+                            tokio::spawn(socks::handle_connection(
+                                stream,
+                                remote_addr,
+                                handler,
+                                ca,
+                                outbound,
+                                upstream_tls,
+                                self.config.addr,
+                            ));
+                        }
+                        ProxyMode::Dns { .. } => unreachable!("DNS mode uses its UDP serve loop"),
+                        ProxyMode::Udp { .. } => unreachable!("UDP mode uses its datagram loop"),
+                        ProxyMode::WireGuard { .. } => {
+                            unreachable!("WireGuard mode uses its UDP serve loop")
+                        }
                     }
                 }
                 Some(req) = recv_replay(&mut replay_rx) => {
@@ -291,6 +384,9 @@ impl Proxy {
                         .with_body_capture_limit(self.config.body_capture_limit);
                     if let Some(ref ic) = self.config.intercept {
                         handler = handler.with_intercept(Arc::clone(ic));
+                    }
+                    if let Some(ref rules) = self.route_rules {
+                        handler = handler.with_route_rules(Arc::clone(rules));
                     }
                     #[cfg(feature = "scripting")]
                     if let Some(ref engine) = script_engine {
@@ -354,8 +450,6 @@ mod tests {
             body_capture_limit: DEFAULT_BODY_CAPTURE_LIMIT,
             #[cfg(feature = "scripting")]
             script_path: None,
-            #[cfg(feature = "scripting")]
-            allow_c_modules: false,
             replay_rx: None,
         };
 

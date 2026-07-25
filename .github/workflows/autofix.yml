@@ -103,7 +103,7 @@ jobs:
           --fail-under-lines "$COVERAGE_MIN_LINES"
       - name: Core proxyapi coverage
         run: >
-          cargo llvm-cov -p proxyapi --all-features --locked
+          cargo llvm-cov report -p proxyapi
           --ignore-filename-regex '(^|/)(tests|target)/'
           --fail-under-lines "$CORE_COVERAGE_TARGET_LINES"
 

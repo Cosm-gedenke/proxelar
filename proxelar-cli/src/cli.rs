@@ -1,5 +1,7 @@
+#[cfg(feature = "scripting")]
+use clap::Subcommand;
 use clap::{Parser, ValueEnum};
-use proxyapi::UpstreamTlsConfig;
+use proxyapi::{UpstreamProxyConfig, UpstreamTlsConfig};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -11,6 +13,10 @@ use std::str::FromStr;
     about = "MITM proxy for HTTP/HTTPS traffic"
 )]
 pub struct Args {
+    #[cfg(feature = "scripting")]
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Interface mode
     #[arg(short, long, default_value = "tui", value_enum)]
     pub interface: Interface,
@@ -27,8 +33,12 @@ pub struct Args {
     #[arg(short = 'b', long, default_value = "127.0.0.1")]
     pub addr: IpAddr,
 
-    /// Target upstream (required for reverse mode)
-    #[arg(short, long, required_if_eq("mode", "reverse"))]
+    /// Target upstream (required for reverse and UDP)
+    #[arg(
+        short,
+        long,
+        required_if_eq_any([("mode", "reverse"), ("mode", "udp")])
+    )]
     pub target: Option<String>,
 
     /// Web GUI port (only used with -i gui)
@@ -39,17 +49,19 @@ pub struct Args {
     #[arg(long, value_name = "DIR")]
     pub ca_dir: Option<PathBuf>,
 
-    /// Path to a Lua script for request/response hooks
+    /// Lua script file or addon directory containing init.lua
     #[arg(short = 's', long = "script", value_name = "FILE")]
     pub script: Option<PathBuf>,
 
-    /// Allow Lua scripts to load native C modules (e.g. lua-protobuf).
-    ///
-    /// Runs the Lua VM in unsafe mode: loaded modules execute unsandboxed native
-    /// code in the proxy process. Only use with trusted scripts.
+    /// Load a validated addon by name from the local addon catalog
     #[cfg(feature = "scripting")]
-    #[arg(long = "allow-c-modules")]
-    pub allow_c_modules: bool,
+    #[arg(long, value_name = "NAME", conflicts_with = "script")]
+    pub addon: Option<String>,
+
+    /// Local addon catalog (default: CA_DIR/addons)
+    #[cfg(feature = "scripting")]
+    #[arg(long, global = true, value_name = "DIR")]
+    pub addons_dir: Option<PathBuf>,
 
     /// Suppress per-request output (only used with -i terminal)
     #[arg(short, long)]
@@ -70,6 +82,129 @@ pub struct Args {
         default_value = "default"
     )]
     pub upstream_trust: UpstreamTlsConfig,
+
+    /// Chain upstream traffic through `http://HOST:PORT` or `socks5://HOST:PORT`
+    #[arg(long, value_name = "URL")]
+    pub upstream_proxy: Option<UpstreamProxyConfig>,
+
+    /// Upstream proxy credentials (`USERNAME:PASSWORD`)
+    #[arg(long, value_name = "USERNAME:PASSWORD", requires = "upstream_proxy")]
+    pub upstream_proxy_auth: Option<String>,
+
+    /// Load a native Proxelar session before capture starts
+    #[arg(long, value_name = "FILE", conflicts_with = "import_har")]
+    pub load_session: Option<PathBuf>,
+
+    /// Import a HAR file before capture starts
+    #[arg(long, value_name = "FILE", conflicts_with = "load_session")]
+    pub import_har: Option<PathBuf>,
+
+    /// Save the complete session on clean shutdown
+    #[arg(long, value_name = "FILE")]
+    pub save_session: Option<PathBuf>,
+
+    /// Export captured HTTP flows as HAR on clean shutdown
+    #[arg(long, value_name = "FILE")]
+    pub export_har: Option<PathBuf>,
+
+    /// Export captured requests as executable curl commands on clean shutdown
+    #[arg(long, value_name = "FILE")]
+    pub export_curl: Option<PathBuf>,
+
+    /// Export captured flows as raw HTTP request/response files
+    #[arg(long, value_name = "DIR")]
+    pub export_raw: Option<PathBuf>,
+
+    /// Include credentials and common secret query parameters in exports
+    #[arg(long)]
+    pub export_secrets: bool,
+
+    /// Fixed bearer token for the GUI/headless REST API (random by default)
+    #[arg(long, value_name = "TOKEN")]
+    pub api_token: Option<String>,
+
+    /// Launch an isolated Chromium profile preconfigured to use this proxy
+    #[arg(long)]
+    pub launch_browser: bool,
+
+    /// Load declarative routing rules from JSON
+    #[arg(long, value_name = "FILE")]
+    pub rules: Option<PathBuf>,
+
+    /// Serve matching URLs from a local directory (`URL_PREFIX=DIR`)
+    #[arg(long, value_name = "URL_PREFIX=DIR")]
+    pub map_local: Vec<Mapping>,
+
+    /// Rewrite matching URL prefixes (`URL_PREFIX=TARGET_PREFIX`)
+    #[arg(long, value_name = "URL_PREFIX=TARGET_PREFIX")]
+    pub map_remote: Vec<Mapping>,
+
+    /// Recursive DNS server used by DNS mode
+    #[arg(long, default_value = "1.1.1.1:53", value_name = "HOST:PORT")]
+    pub dns_upstream: String,
+
+    /// Override a DNS name (`DOMAIN=IP`); repeat for multiple names
+    #[arg(long, value_name = "DOMAIN=IP")]
+    pub dns_map: Vec<Mapping>,
+
+    /// Public/LAN HOST:PORT written to the generated WireGuard client config
+    #[arg(long, value_name = "HOST:PORT")]
+    pub wireguard_endpoint: Option<String>,
+}
+
+#[cfg(feature = "scripting")]
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Manage validated Lua addon packages
+    Addon {
+        #[command(subcommand)]
+        command: AddonCommand,
+    },
+}
+
+#[cfg(feature = "scripting")]
+#[derive(Debug, Subcommand)]
+pub enum AddonCommand {
+    /// List installed addons
+    List,
+    /// Print a validated addon's manifest
+    Inspect {
+        /// Installed addon name or package directory
+        addon: PathBuf,
+    },
+    /// Verify a package without installing it
+    Verify {
+        /// Addon package directory
+        package: PathBuf,
+    },
+    /// Verify and atomically install a local package
+    Install {
+        /// Addon package directory
+        package: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Mapping {
+    pub source: String,
+    pub target: String,
+}
+
+impl FromStr for Mapping {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (source, target) = value
+            .split_once('=')
+            .ok_or_else(|| "expected SOURCE=TARGET".to_owned())?;
+        if source.is_empty() || target.is_empty() {
+            return Err("SOURCE and TARGET must not be empty".to_owned());
+        }
+        Ok(Self {
+            source: source.to_owned(),
+            target: target.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,17 +237,22 @@ impl FromStr for BodyCaptureLimit {
     }
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Interface {
     Terminal,
     Tui,
     Gui,
+    Api,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Mode {
     Forward,
     Reverse,
+    Socks5,
+    Dns,
+    Udp,
+    Wireguard,
 }
 
 #[cfg(test)]
@@ -130,6 +270,8 @@ mod tests {
             proxyapi::DEFAULT_BODY_CAPTURE_LIMIT
         );
         assert_eq!(args.upstream_trust, UpstreamTlsConfig::Default);
+        #[cfg(feature = "scripting")]
+        assert!(args.command.is_none());
     }
 
     #[test]
@@ -143,6 +285,19 @@ mod tests {
     fn test_reverse_requires_target() {
         let result = Args::try_parse_from(["proxelar", "-m", "reverse"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_udp_requires_target_and_dns_accepts_hostname_upstream() {
+        assert!(Args::try_parse_from(["proxelar", "-m", "udp"]).is_err());
+        let args = Args::parse_from([
+            "proxelar",
+            "-m",
+            "dns",
+            "--dns-upstream",
+            "resolver.example:53",
+        ]);
+        assert_eq!(args.dns_upstream, "resolver.example:53");
     }
 
     #[test]
@@ -215,5 +370,28 @@ mod tests {
             let result = Args::try_parse_from(["proxelar", "--upstream-trust", value]);
             assert!(result.is_err(), "{value:?} should be rejected");
         }
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn test_addon_commands_and_runtime_selection_parse() {
+        let args = Args::parse_from(["proxelar", "addon", "install", "./my-addon"]);
+        assert!(matches!(
+            args.command,
+            Some(Command::Addon {
+                command: AddonCommand::Install { .. }
+            })
+        ));
+
+        let args = Args::parse_from(["proxelar", "--addon", "header-tagger"]);
+        assert_eq!(args.addon.as_deref(), Some("header-tagger"));
+        assert!(Args::try_parse_from([
+            "proxelar",
+            "--addon",
+            "header-tagger",
+            "--script",
+            "dev.lua"
+        ])
+        .is_err());
     }
 }
