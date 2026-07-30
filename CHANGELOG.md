@@ -10,6 +10,8 @@
 ### Added
 
 - Publish `.deb` packages for `x86_64` and `aarch64` Linux alongside the existing release archives.
+- Document winget as an installation channel now that the package is available on the Windows Package Manager.
+- Document Docker/Podman on the installation page, which previously listed it only in the README.
 
 ## [0.5.0] - 2026-07-25
 
