@@ -36,7 +36,7 @@ Proxelar is intentionally developer-oriented: terminal-first, scriptable, Rust-n
 
 ## Why use it?
 
-- **One local binary** — install with Homebrew, Cargo, Docker/Podman, or GitHub releases.
+- **One local binary** — install with Homebrew, winget, Cargo, Docker/Podman, or GitHub releases.
 - **Four interfaces** — TUI, plain terminal output, browser GUI, or a headless REST API.
 - **Lua scripting** — `on_request` and `on_response` hooks can rewrite, block, short-circuit, or mock traffic.
 - **Interactive intercept** — pause requests, edit method/URI/headers/body, forward, drop, or replay.
@@ -55,6 +55,12 @@ Proxelar is intentionally developer-oriented: terminal-first, scriptable, Rust-n
 
 ```bash
 brew install proxelar
+```
+
+### winget (Windows)
+
+```bash
+winget install --id EmanueleMicheletti.Proxelar --exact
 ```
 
 ### Cargo

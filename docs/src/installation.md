@@ -6,6 +6,12 @@
 brew install proxelar
 ```
 
+## winget (Windows)
+
+```bash
+winget install --id EmanueleMicheletti.Proxelar --exact
+```
+
 ## From crates.io
 
 ```bash
