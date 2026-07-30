@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Publish `.deb` packages for `x86_64` and `aarch64` Linux alongside the existing release archives.
+
 ## [0.5.0] - 2026-07-25
 
 ### Added

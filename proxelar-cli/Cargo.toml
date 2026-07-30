@@ -13,6 +13,28 @@ readme = "../README.md"
 categories = ["command-line-utilities", "development-tools", "network-programming"]
 keywords = ["proxy", "mitm", "http", "https", "lua"]
 
+[package.metadata.deb]
+maintainer = "Emanuele Micheletti <micheletti.emanuele@hotmail.com>"
+copyright = "2026, Emanuele Micheletti <micheletti.emanuele@hotmail.com>"
+license-file = ["../LICENSE-MIT", "0"]
+section = "net"
+priority = "optional"
+# OpenSSL and Lua are vendored, so only the C runtime is resolved dynamically.
+# Set explicitly rather than via `$auto`, which cannot run dpkg-shlibdeps when
+# the aarch64 binary is cross-built on an amd64 runner.
+depends = "libc6, libgcc-s1"
+extended-description = """
+Proxelar is a single-binary MITM proxy for inspecting, intercepting, replaying
+and rewriting HTTP, HTTPS and WebSocket traffic. It runs as an interactive TUI,
+plain terminal output, a web GUI, or a headless REST API, and supports forward,
+reverse, WireGuard, SOCKS5, DNS and fixed-target UDP capture modes, Lua hooks,
+declarative rules, and HAR/curl/raw export with secret redaction."""
+assets = [
+    ["target/release/proxelar", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/proxelar/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/proxelar/CHANGELOG.md", "644"],
+]
+
 [features]
 default = ["scripting", "vendored-lua"]
 scripting = ["proxyapi/scripting"]
