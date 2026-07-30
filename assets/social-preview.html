@@ -1,0 +1,79 @@
+<meta charset="utf-8">
+<!--
+  Source for assets/social-preview.png, the GitHub social preview card
+  (Settings > General > Social preview). GitHub wants 1280x640.
+
+  To regenerate after editing:
+    1. python3 -m http.server 8791     # file:// is blocked by some capture tools
+    2. open http://127.0.0.1:8791/social-preview.html in a 1710px-wide viewport
+    3. screenshot the page, then crop the card and rescale to exactly 1280x640:
+       ffmpeg -i shot.png -vf "crop=W:H:0:0,scale=1280:640:flags=lanczos" social-preview.png
+
+  The card is authored at 1280x640 and painted at 1710x855 (scale 1.3359375) so the
+  capture can be downscaled back to 1280x640 instead of upscaled, which keeps text crisp.
+-->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1710px; height: 856px; overflow: hidden; background: #0d1117; }
+
+  /* Design authored at 1280x640, painted at 1710x855 so the captured
+     screenshot can be downscaled back to 1280x640 without upscaling. */
+  .card {
+    width: 1280px; height: 640px;
+    transform: scale(1.3359375);
+    transform-origin: 0 0;
+    background: #0d1117;
+    background-image:
+      radial-gradient(ellipse 900px 500px at 80% 110%, rgba(232,163,61,0.16), transparent 60%),
+      radial-gradient(ellipse 700px 400px at 10% -10%, rgba(232,163,61,0.07), transparent 60%);
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    color: #e6edf3;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 0 72px;
+    position: relative;
+  }
+  .rule { position: absolute; left: 0; top: 0; width: 100%; height: 6px;
+          background: linear-gradient(90deg, #e8a33d 0%, #d97757 45%, #0d1117 100%); }
+  .eyebrow { font-family: ui-monospace, Menlo, monospace; font-size: 21px; letter-spacing: 0.22em;
+             text-transform: uppercase; color: #e8a33d; margin-bottom: 22px; font-weight: 600; }
+  h1 { font-size: 118px; line-height: 0.94; letter-spacing: -0.035em; font-weight: 800; color: #fff; }
+  .tag { font-size: 33px; line-height: 1.32; color: #b9c4cf; margin-top: 24px; max-width: 900px; font-weight: 400; }
+  .tag b { color: #fff; font-weight: 600; }
+  .chips { display: flex; gap: 12px; margin-top: 40px; flex-wrap: wrap; }
+  .chip { font-family: ui-monospace, Menlo, monospace; font-size: 20px; padding: 9px 18px;
+          border: 1.5px solid rgba(232,163,61,0.45); border-radius: 999px; color: #e8a33d;
+          background: rgba(232,163,61,0.07); }
+  .foot { position: absolute; bottom: 44px; left: 72px; right: 72px;
+          display: flex; justify-content: space-between; align-items: center;
+          font-family: ui-monospace, Menlo, monospace; font-size: 21px; color: #7d8895; }
+  .foot .cmd { color: #e6edf3; }
+  .foot .cmd .p { color: #e8a33d; }
+</style>
+
+<div class="card">
+  <div class="rule"></div>
+
+  <div class="eyebrow">Rust &nbsp;&middot;&nbsp; MIT &nbsp;&middot;&nbsp; single binary</div>
+
+  <h1>Proxelar</h1>
+
+  <div class="tag">
+    Scriptable MITM proxy to <b>inspect, intercept, replay</b><br>
+    and <b>rewrite</b> HTTP, HTTPS and WebSocket traffic.
+  </div>
+
+  <div class="chips">
+    <div class="chip">TUI</div>
+    <div class="chip">Web GUI</div>
+    <div class="chip">REST API</div>
+    <div class="chip">Lua hooks</div>
+    <div class="chip">WireGuard &middot; SOCKS5 &middot; DNS</div>
+  </div>
+
+  <div class="foot">
+    <div class="cmd"><span class="p">$</span> brew install proxelar</div>
+    <div>github.com/emanuele-em/proxelar</div>
+  </div>
+</div>
