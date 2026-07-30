@@ -10,8 +10,13 @@
 ### Added
 
 - Publish `.deb` packages for `x86_64` and `aarch64` Linux alongside the existing release archives.
+- Publish the container image to `ghcr.io/emanuele-em/proxelar` on every release, with build provenance attestation.
 - Document winget as an installation channel now that the package is available on the Windows Package Manager.
 - Document Docker/Podman on the installation page, which previously listed it only in the README.
+
+### Fixed
+
+- Build the container image with `--locked` so it resolves the same dependency versions as the released binaries.
 
 ## [0.5.0] - 2026-07-25
 

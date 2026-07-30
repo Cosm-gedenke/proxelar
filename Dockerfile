@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY . .
 
-RUN cargo build --release --workspace
+RUN cargo build --release --locked --workspace
 
 # ---- runtime ----
 FROM debian:bookworm-slim
